@@ -13,11 +13,13 @@ post by post. The series lives at
 
     maze/            source, namespace `maze/…` — the grid model, and
       algorithm/     the maze-generation algorithms under maze/algorithm/…
+    deps/            pinned x-lang modules (manifest: pin.xon)
     tests/           per-chapter examples with expected output
 
 ## Requirements
 
-[x-lang](https://github.com/jonruttan/x-lang) (the `x` command).
+[x-lang](https://github.com/jonruttan/x-lang) (the `x` command). The library
+modules the code depends on are pinned under `deps/`.
 
 ## Licence
 

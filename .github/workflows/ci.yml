@@ -1,0 +1,47 @@
+name: CI
+
+# Build x-lang from a pinned commit and verify the pinned dependency overlay.
+# Maze smoke tests get added alongside the first algorithm.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # x-lang main @ 319ddb32 — carries the Pin tooling. Full 40-char SHA:
+  # actions/checkout can't fetch an abbreviated one. Bump on a deliberate
+  # re-vendor, or move to a release tag once one ships the tooling.
+  X_LANG_REF: "319ddb321820e3e7e995bc7d02e8117b83d94f35"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Checkout x-lang (the pinned ref with the Pin tooling)
+        uses: actions/checkout@v5
+        with:
+          repository: jonruttan/x-lang
+          ref: ${{ env.X_LANG_REF }}
+          path: x-lang
+          submodules: recursive
+
+      - name: Build and install x
+        run: |
+          make -C x-lang
+          make -C x-lang install PREFIX="$HOME/.local"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify the pin (overlay must equal the lock)
+        run: |
+          cat > "$RUNNER_TEMP/verify.x" <<'XEOF'
+          (import x/tool/pin)
+          (display "pin verify: ") (display (Pin verify "deps")) (newline)
+          XEOF
+          x -f "$RUNNER_TEMP/verify.x"
