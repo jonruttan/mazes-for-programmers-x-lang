@@ -1,1 +1,2 @@
 (root "deps")
+(boot "boot/he.x")
