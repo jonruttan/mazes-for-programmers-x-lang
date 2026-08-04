@@ -1,7 +1,9 @@
 name: CI
 
-# Build x-lang from a pinned commit and verify the pinned dependency overlay.
-# Maze smoke tests get added alongside the first algorithm.
+# Verify the pins against the release they freeze: the engine comes from the
+# release's binary tarball (no toolchain, no source build), the boot from the
+# committed amalgam (boot/he.x), the libraries from the committed overlay
+# (deps/). If any of the three drifts, this goes red.
 
 on:
   push:
@@ -11,37 +13,40 @@ on:
   workflow_dispatch:
 
 env:
-  # x-lang main @ 319ddb32 — carries the Pin tooling. Full 40-char SHA:
-  # actions/checkout can't fetch an abbreviated one. Bump on a deliberate
-  # re-vendor, or move to a release tag once one ships the tooling.
-  X_LANG_REF: "319ddb321820e3e7e995bc7d02e8117b83d94f35"
+  # The release both tiers are pinned to. Bump only on a deliberate re-pin
+  # (re-fetch the amalgam, re-verify the overlay, update this tag together).
+  X_LANG_TAG: "v0.3.1-rc5"
 
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Checkout x-lang (the pinned ref with the Pin tooling)
-        uses: actions/checkout@v5
-        with:
-          repository: jonruttan/x-lang
-          ref: ${{ env.X_LANG_REF }}
-          path: x-lang
-          submodules: recursive
-
-      - name: Build and install x
+      - name: Install x from the release tarball
         run: |
-          make -C x-lang
-          make -C x-lang install PREFIX="$HOME/.local"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          base="https://github.com/jonruttan/x-lang/releases/download/${X_LANG_TAG}"
+          curl -fsSLO "${base}/x-${X_LANG_TAG}-linux-x86_64.tar.gz"
+          curl -fsSLO "${base}/x-${X_LANG_TAG}-linux-x86_64.tar.gz.sha256"
+          sha256sum -c "x-${X_LANG_TAG}-linux-x86_64.tar.gz.sha256"
+          tar xzf "x-${X_LANG_TAG}-linux-x86_64.tar.gz"
+          # Absolute path: the relocatable wrapper resolves its tree from $0.
+          echo "$PWD/x-${X_LANG_TAG}/bin" >> "$GITHUB_PATH"
 
-      - name: Verify the pin (overlay must equal the lock)
+      - name: Verify the overlay (must equal the lock)
         run: |
           cat > "$RUNNER_TEMP/verify.x" <<'XEOF'
           (import x/tool/pin)
           (display "pin verify: ") (display (Pin verify "deps")) (newline)
           XEOF
           x -f "$RUNNER_TEMP/verify.x"
+
+      - name: Pinned proof (boot + overlay armed, program runs)
+        run: |
+          x -f tests/pin-proof.x > out.txt 2> err.txt || { cat err.txt; exit 1; }
+          cat out.txt err.txt
+          grep -q "pinned: "      err.txt || { echo "FAIL: overlay pin not armed"; exit 1; }
+          grep -q "pinned boot: " err.txt || { echo "FAIL: boot pin not armed"; exit 1; }
+          grep -qx "#t" out.txt           || { echo "FAIL: proof did not run"; exit 1; }
