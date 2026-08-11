@@ -1,2 +1,7 @@
+; What this project is pinned to.
+;   root — the overlay: our own copy of the library modules we import
+;   src  — the tree Pin scans to work out what those are
+;   boot — the language itself: a verified amalgam from a release
 (root "deps")
+(src "maze")
 (boot "boot/he.x")

@@ -1,9 +1,17 @@
 name: CI
 
-# Verify the pins against the release they freeze: the engine comes from the
-# release's binary tarball (no toolchain, no source build), the boot from the
-# committed amalgam (boot/he.x), the libraries from the committed overlay
-# (deps/). If any of the three drifts, this goes red.
+# The code runs on a pinned language. pin.xon names a verified amalgam
+# (boot/he.x) fetched from an x-lang release, and deps.lock.xon records that
+# release's tag, its ISA fingerprint, and the amalgam's digest.
+#
+# An amalgam pairs with the engine from its own release, so CI installs the
+# engine from exactly the tag the lock names -- the "matches the lock" step
+# below fails if the two ever drift apart.
+#
+# The module overlay (root "deps") is declared and empty: there is no maze
+# code yet, so nothing imports anything to pin. When the first algorithm
+# lands, `(Pin sync)` fills it from the source tree and `(Pin check)` joins
+# this job.
 
 on:
   push:
@@ -13,40 +21,49 @@ on:
   workflow_dispatch:
 
 env:
-  # The release both tiers are pinned to. Bump only on a deliberate re-pin
-  # (re-fetch the amalgam, re-verify the overlay, update this tag together).
-  X_LANG_TAG: "v0.3.1-rc5"
+  X_LANG_VERSION: "v0.3.1-rc8"
 
 jobs:
-  verify:
+  test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install x from the release tarball
+      - name: Engine matches the lock
         run: |
-          base="https://github.com/jonruttan/x-lang/releases/download/${X_LANG_TAG}"
-          curl -fsSLO "${base}/x-${X_LANG_TAG}-linux-x86_64.tar.gz"
-          curl -fsSLO "${base}/x-${X_LANG_TAG}-linux-x86_64.tar.gz.sha256"
-          sha256sum -c "x-${X_LANG_TAG}-linux-x86_64.tar.gz.sha256"
-          tar xzf "x-${X_LANG_TAG}-linux-x86_64.tar.gz"
+          locked=$(sed -n 's/^(release "\(.*\)")$/\1/p' deps.lock.xon)
+          echo "lock: $locked   ci: $X_LANG_VERSION"
+          [ "$locked" = "$X_LANG_VERSION" ] || {
+            echo "FAIL: the engine CI installs is not the release the boot pin names"; exit 1; }
+
+      - name: Install x from that release
+        run: |
+          base="https://github.com/jonruttan/x-lang/releases/download/${X_LANG_VERSION}"
+          curl -fsSLO "${base}/x-${X_LANG_VERSION}-linux-x86_64.tar.gz"
+          curl -fsSLO "${base}/x-${X_LANG_VERSION}-linux-x86_64.tar.gz.sha256"
+          sha256sum -c "x-${X_LANG_VERSION}-linux-x86_64.tar.gz.sha256"
+          tar xzf "x-${X_LANG_VERSION}-linux-x86_64.tar.gz"
           # Absolute path: the relocatable wrapper resolves its tree from $0.
-          echo "$PWD/x-${X_LANG_TAG}/bin" >> "$GITHUB_PATH"
+          echo "$PWD/x-${X_LANG_VERSION}/bin" >> "$GITHUB_PATH"
 
-      - name: Verify the overlay (must equal the lock)
+      - name: Tests
         run: |
-          cat > "$RUNNER_TEMP/verify.x" <<'XEOF'
-          (import x/tool/pin)
-          (display "pin verify: ") (display (Pin verify "deps")) (newline)
-          XEOF
-          x -f "$RUNNER_TEMP/verify.x"
+          rc=0
+          for t in tests/*.x; do
+            printf '%s: ' "$t"
+            if out=$(x -f "$t" 2>&1) && [ "$(printf '%s' "$out" | tail -1)" = "#t" ]; then
+              echo ok
+            else
+              echo FAIL; printf '%s\n' "$out"; rc=1
+            fi
+          done
+          exit $rc
 
-      - name: Pinned proof (boot + overlay armed, program runs)
+      - name: The pin was actually armed
         run: |
-          x -f tests/pin-proof.x > out.txt 2> err.txt || { cat err.txt; exit 1; }
-          cat out.txt err.txt
+          x -f tests/pin-proof.x 2> err.txt
+          cat err.txt
           grep -q "pinned: "      err.txt || { echo "FAIL: overlay pin not armed"; exit 1; }
           grep -q "pinned boot: " err.txt || { echo "FAIL: boot pin not armed"; exit 1; }
-          grep -qx "#t" out.txt           || { echo "FAIL: proof did not run"; exit 1; }

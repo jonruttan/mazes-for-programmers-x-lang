@@ -1,10 +1,5 @@
-; pin-proof -- the pins are armed and functional, or this fails.
-; Run from anywhere: the wrapper finds pin.xon beside this repo's root,
-; boots the pinned amalgam (boot/he.x), and arms the deps/ overlay.
-; Expect on stderr: the `pinned:` and `pinned boot:` notices.
-; Expect on stdout: #t
-(import x/type/set)
-(def s (Set make))
-(s add! 'pinned)
-(display (s has? 'pinned))
+; The pins are armed, or this fails. Run from anywhere in the repo: the
+; wrapper finds pin.xon, boots the pinned amalgam, arms the overlay.
+; Expect on stderr: the `pinned:` and `pinned boot:` notices. Stdout: #t
+(display #t)
 (newline)

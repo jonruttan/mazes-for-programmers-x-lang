@@ -1,0 +1,4 @@
+; pin.lock.xon -- generated; do not edit
+(release "v0.3.1-rc8")
+(isa "sha256:8627a521367a0b38ab45678f648336b7857600f368159c56841b1b70889059f0")
+(boot "he.x" "sha256:367406a9ed1e5dbf7d4b8c6ae0a3ad35f6000c95ee061e6e83e290ead0a68d72")
