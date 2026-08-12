@@ -1,7 +1,11 @@
 ; What this project is pinned to.
-;   root — the overlay: our own copy of the library modules we import
-;   src  — the tree Pin scans to work out what those are
+;   root — overlay roots, first listed wins:
+;          "."    — this repo itself, so maze/… resolves to maze/ in the
+;                   standard layout (maze/grid@1.2.x provides maze/grid)
+;          "deps" — our own copy of the x-lang library modules we import
+;   src  — the tree the pin verbs scan to work out what to vendor
 ;   boot — the language itself: a verified amalgam from a release
+(root ".")
 (root "deps")
 (src "maze")
 (boot "boot/he.x")

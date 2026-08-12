@@ -1,0 +1,274 @@
+; dict.x -- Dict: a mutable hash table (buckets over a raw slot vector).
+;
+; THE associative container with O(1) expected lookup -- Assoc (alists) is
+; O(n) and eq?-keyed, so string keys don't work there at all. Dict hashes
+; symbol, string, integer, and char keys by CONTENT (FNV-1a) and compares
+; them with equal?. Class instances are IDENTITY keys: hashed by address
+; (sound: the mark-sweep GC frees in place, never relocates, and a live key
+; is rooted by the table itself) and compared with eq?, so equal-but-distinct
+; instances stay distinct keys. Anything else errors loudly instead of
+; misbehaving silently.
+;
+; Internals: `store` is a vector (slot 0 = capacity, the raw-obj pattern)
+; whose slots 1..cap each hold an alist bucket of (key . val) pairs; `n`
+; counts entries; set! doubles the table past a 3/4 load factor.
+
+(import x/type/class)
+(import x/type/hash)
+(import x/type/vector)
+(import x/type/list)
+
+; Fetch the raw slot prims from the catalog (ns `obj` is de-registered, R5).
+(def %dict-obj-ref (prim-ref 'obj 'ref))
+(def %dict-obj-set! (prim-ref 'obj 'set!))
+; Fetch the char cast (ns `char` utility members de-registered, R5).
+(def %dict-char->int (prim-ref 'char '->int))
+; Fetch the address casts (ffi.c) for instance identity keys.
+(def %dict-obj->ptr (prim-ref 'obj '->ptr))
+(def %dict-ptr->int (prim-ref 'ptr '->int))
+
+(def %dict-mask31 2147483647)  ; FNV-1a is 64-bit SIGNED -- mask before %
+
+; Machine-INT test, boot-safe (type handles are C-static atoms, so eq? is
+; pointer-stable). `number?` is too wide to gate the bitwise mask below:
+; a float is a number but `&` on a boxed float is not an operation.
+(def %dict-type-of (prim-ref (lit type) (lit of)))
+(def %dict-int-type (%dict-type-of 0))
+(def %dict-int? (fn (_ n) (if (null? n) #f (eq? (%dict-type-of n) %dict-int-type))))
+
+; Content hash per supported key type; instances hash by address (identity).
+; The address is stable: mark-sweep frees in place, and a keyed instance is
+; rooted by its bucket entry, so its address cannot be freed and reused while
+; the entry lives. >>4 drops the malloc-alignment zero bits before bucketing.
+; Non-negative by construction, so the bucket index (% h cap) never goes
+; negative (C-truncating % keeps the sign).
+(def %dict-hash
+  (fn (_ k)
+    (match
+      ((symbol? k) (& (Hash fnv-1a (symbol->str k)) %dict-mask31))
+      ((str? k) (& (Hash fnv-1a k) %dict-mask31))
+      ((%dict-int? k) (& k %dict-mask31))
+      ((char? k) (%dict-char->int k))
+      ((object? k) (& (>> (%dict-ptr->int (%dict-obj->ptr k)) 4) %dict-mask31))
+      (#t (Err raise 'type "Dict: unhashable key -- use a symbol, string, integer, char, or class instance" ())))))
+
+; Bucket key equality: instances are identity keys, compared with same? --
+; strict object identity; NEVER eq?, which compares value words, and NEVER
+; equal?, which would recurse into the field box and loop on cyclic
+; instances -- while content keys keep equal?.
+(def %dict-key=
+  (fn (_ a b) (if (object? a) (same? a b) (equal? a b))))
+
+; Find the (key . val) entry pair in a bucket, or (). Returning the ENTRY
+; (a box), not the value, keeps presence distinguishable from a stored nil.
+(def %dict-find
+  (fn (self k bucket)
+    (match
+      ((null? bucket) ())
+      ((%dict-key= k (first (first bucket))) (first bucket))
+      (#t (self k (rest bucket))))))
+
+(def %dict-remove
+  (fn (self k bucket)
+    (match
+      ((null? bucket) ())
+      ((%dict-key= k (first (first bucket))) (rest bucket))
+      (#t (pair (first bucket) (self k (rest bucket)))))))
+
+(def-class Dict ()
+  (doc "A mutable hash table: O(1) expected get/set!/del! over content-hashed keys."
+    (note "Keys may be symbols, strings, integers, or chars (hashed by content, compared with equal?), or class instances (identity keys: hashed by address, compared with same?); anything else errors.")
+    (note "Mutators (set!/del!) return the dict for chaining. get-or is presence-based: a stored nil is returned, not the default.")
+    (note "Every association shape has a named door: from-alist ((k . v) ...), from-plist (k v k v ...), from-bindings ((k v) ...) -- and ->alist/->plist/->bindings back out.")
+    (example "((Dict from-plist (list 'a 1 'b 2)) get 'b)" "2")
+    (see make) (see get) (see set!) (see from-plist))
+
+  store  ; bucket vector: slot 0 = cap, slots 1..cap = (key . val) alists
+  cap    ; bucket count
+  n      ; entry count
+
+  (static
+    (method dict? (self (param x ANY "Value to test"))
+      (doc "Test whether a value is a Dict." (returns BOOL "#t when x is a Dict instance"))
+      (if (object? x) (instance-of? x self) #f))
+
+    (method make (self . opt)
+      (doc "An empty dict. Pass a capacity to pre-size the bucket table."
+        (param opt LIST "Optional (capacity) -- initial bucket count, default 8")
+        (returns Dict "A new empty dict")
+        (example "((Dict make) empty?)" "#t"))
+      (def c (if (pair? opt) (first opt) 8))
+      (new-from self (list 'store (Vector make c ()) 'cap c 'n 0)))
+
+    ; Constructor adjudication (one meaning per name): `make` is THE public
+    ; constructor (positional, sizing args); `new` is the class system's
+    ; member-init record door, which cannot build a container's internal
+    ; state.  No refusal method here -- documenting a door only to slam it
+    ; is worse than the disease.  The generic new builds an inert instance
+    ; and the %slot uninitialized guard below raises the teaching 'state
+    ; Err at first USE, which is where the harm would happen.
+
+    (method from-plist (self (param plist LIST "Flat (k v k v ...) plist"))
+      (doc "Build a dict from a flat plist -- the simplest literal shape."
+        (returns Dict "A dict of the plist's pairs")
+        (example "((Dict from-plist (list 'a 1 'b 2)) get 'b)" "2"))
+      (def d (self make))
+      (let go ((ps plist))
+        (match
+          ((null? ps) d)
+          ((null? (rest ps)) (Err raise 'value "Dict from-plist: odd-length plist" ()))
+          (#t (do (d set! (first ps) (first (rest ps))) (go (rest (rest ps))))))))
+
+    (method from-bindings (self (param bindings LIST "Bindings list: ((key value) ...), the let shape"))
+      (doc "Build a dict from a bindings list."
+        (returns Dict "A dict of the bindings")
+        (example "((Dict from-bindings (list (list 'a 1))) get 'a)" "1"))
+      (def d (self make))
+      (List for-each (fn (_ b) (d set! (first b) (first (rest b)))) bindings)
+      d)
+
+    (method from-alist (self (param alist LIST "Alist ((key . val) ...) to load"))
+      (doc "Build a dict from an alist (later duplicates overwrite earlier)."
+        (returns Dict "A dict holding the alist's assocs")
+        (example "((Dict from-alist (list (pair \"a\" 1))) get \"a\")" "1"))
+      (def d (self make))
+      (List for-each (fn (_ e) (d set! (first e) (rest e))) alist)
+      d))
+
+  ; --- internals ----------------------------------------------------------
+  ; Bucket slot index (1-based; slot 0 is the capacity) for a key.
+  (method %slot (self k)
+    ; Uninitialized guard: an instance built outside make (raw new-from)
+    ; has nil members; fail loudly here instead of feeding nil to the raw
+    ; slot layer (segfault class).
+    (when (null? (member 'cap)) (Err raise 'state "Dict: uninitialized instance (use Dict make / from-*)" ()))
+    (+ 1 (% (%dict-hash k) (member 'cap))))
+
+  ; Double the table and rehash. Entry pairs are reused (rehash moves them
+  ; between buckets; it does not copy), so this is O(n) with no reallocation
+  ; of the entries themselves.
+  (method %grow! (self)
+    (def old (member 'store))
+    (def oldcap (member 'cap))
+    (def newcap (* 2 oldcap))
+    (set-member! 'store (Vector make newcap ()))
+    (set-member! 'cap newcap)
+    (let go ((i 1))
+      (unless (> i oldcap)
+        (do (List for-each
+              (fn (_ e)
+                (let ((j (self %slot (first e))))
+                  (%dict-obj-set! (member 'store) j
+                    (pair e (%dict-obj-ref (member 'store) j)))))
+              (%dict-obj-ref old i))
+            (go (+ i 1))))))
+
+  ; --- lookup -------------------------------------------------------------
+  (method get (self k)
+    (doc "The value stored under a key, or nil when absent."
+      (param k ANY "Key (symbol, string, integer, or char)")
+      (returns ANY "Stored value, or nil")
+      (example "(let ((d (Dict make))) (d set! 'a 1) (d get 'a))" "1"))
+    (let ((hit (%dict-find k (%dict-obj-ref (member 'store) (self %slot k)))))
+      (unless (null? hit) (rest hit))))
+
+  (method get-or (self d k)
+    (doc "The value stored under a key, or a default only when the key is ABSENT."
+      (param d ANY "Default for an absent key")
+      (param k ANY "Key to look up")
+      (returns ANY "Stored value (a stored nil included), or the default"))
+    (let ((hit (%dict-find k (%dict-obj-ref (member 'store) (self %slot k)))))
+      (if (null? hit) d (rest hit))))
+
+  (method get-or-else (self thunk k)
+    (doc "The value stored under a key, or (thunk) only when the key is ABSENT -- get-or's lazy twin (mirrors Assoc opt-get-or-else)."
+      (param thunk CALLABLE "Nullary default producer; runs only on a miss")
+      (param k ANY "Key to look up")
+      (returns ANY "Stored value (a stored nil included), or (thunk)"))
+    (let ((hit (%dict-find k (%dict-obj-ref (member 'store) (self %slot k)))))
+      (if (null? hit) (thunk) (rest hit))))
+
+  (method has? (self k)
+    (doc "Test whether a key is present."
+      (param k ANY "Key to test")
+      (returns BOOL "#t when the key is stored"))
+    (pair? (%dict-find k (%dict-obj-ref (member 'store) (self %slot k)))))
+
+  ; --- mutation -----------------------------------------------------------
+  (method set! (self k v)
+    (doc "Store a value under a key (overwriting any previous value); returns the dict for chaining."
+      (param k ANY "Key (symbol, string, integer, or char)")
+      (param v ANY "Value to store")
+      (returns Dict "self")
+      (example "(((Dict make) set! 'a 1) get 'a)" "1"))
+    (def i (self %slot k))
+    (def bucket (%dict-obj-ref (member 'store) i))
+    (def hit (%dict-find k bucket))
+    (if (null? hit)
+      (do (%dict-obj-set! (member 'store) i (pair (pair k v) bucket))
+          (set-member! 'n (+ (member 'n) 1))
+          (when (> (* 4 (member 'n)) (* 3 (member 'cap)))
+            (self %grow!)))
+      (%set-rest! hit v))
+    self)
+
+  (method del! (self k)
+    (doc "Remove a key (a no-op when absent); returns the dict for chaining."
+      (param k ANY "Key to remove")
+      (returns Dict "self"))
+    (def i (self %slot k))
+    (def bucket (%dict-obj-ref (member 'store) i))
+    (when (pair? (%dict-find k bucket))
+      (do (%dict-obj-set! (member 'store) i (%dict-remove k bucket))
+          (set-member! 'n (- (member 'n) 1))))
+    self)
+
+  ; --- size ---------------------------------------------------------------
+  (method length (self)
+    (doc "The number of stored entries (a stored property, O(1))." (returns INT "Entry count"))
+    (member 'n))
+
+  (method empty? (self)
+    (doc "Test whether the dict holds no entries." (returns BOOL "#t when empty"))
+    (= 0 (member 'n)))
+
+  ; --- extraction ---------------------------------------------------------
+  (method ->alist (self)
+    (doc "A fresh alist snapshot of the entries (unordered)."
+      (returns LIST "((key . val) ...) -- new assocs, detached from the table"))
+    ; copy each entry: the live (key . val) pairs are mutated by set!, so a
+    ; snapshot must not alias them
+    (let go ((i 1) (acc ()))
+      (if (> i (member 'cap)) acc
+        (go (+ i 1)
+            (List fold (fn (_ a e) (pair (pair (first e) (rest e)) a))
+              acc (%dict-obj-ref (member 'store) i))))))
+
+  (method ->plist (self)
+    (doc "The entries as a flat (k v k v ...) plist snapshot (unordered)."
+      (returns LIST "Plist of the entries"))
+    (List fold (fn (_ acc e) (pair (first e) (pair (rest e) acc))) () (self ->alist)))
+
+  (method ->bindings (self)
+    (doc "The entries as a bindings list ((key value) ...) snapshot (unordered)."
+      (returns LIST "Bindings list of the entries"))
+    (List map (fn (_ e) (list (first e) (rest e))) (self ->alist)))
+
+  (method keys (self)
+    (doc "All stored keys (unordered)." (returns LIST "List of keys"))
+    (List map first (self ->alist)))
+
+  (method vals (self)
+    (doc "All stored values (unordered)." (returns LIST "List of values"))
+    (List map rest (self ->alist)))
+
+  (method for-each (self f)
+    (doc "Apply f to each (key . val) entry pair, for side effects."
+      (param f CALLABLE "Applied to each (key . val) pair")
+      (returns ANY "nil"))
+    (List for-each f (self ->alist))))
+
+(doc (provide x/type/dict Dict)
+  (note "Buckets over a raw slot vector; content hashing (FNV-1a) + equal? keys, instances by identity (address hash + eq?); doubles past a 3/4 load factor.")
+  (example "(let ((d (Dict make))) (d set! \"k\" 1) (d get \"k\"))" "1")
+  "Dict: a mutable content-hashed table -- the O(1) associative container.")
