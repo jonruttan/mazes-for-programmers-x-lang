@@ -1,17 +1,13 @@
 name: CI
 
 # The code runs on a pinned language. pin.xon names a verified amalgam
-# (boot/he.x) fetched from an x-lang release, and deps.lock.xon records that
-# release's tag, its ISA fingerprint, and the amalgam's digest.
+# (boot/he.x) from an x-lang release, and deps.lock.xon records that
+# release's tag, its ISA fingerprint, the amalgam's digest, and the digest
+# of every module vendored into the overlay.
 #
 # An amalgam pairs with the engine from its own release, so CI installs the
-# engine from exactly the tag the lock names -- the "matches the lock" step
-# below fails if the two ever drift apart.
-#
-# The module overlay (root "deps") is declared and empty: there is no maze
-# code yet, so nothing imports anything to pin. When the first algorithm
-# lands, `(Pin sync)` fills it from the source tree and `(Pin check)` joins
-# this job.
+# engine from exactly the tag the lock names -- the guard below fails if
+# the two drift apart. The overlay is then verified against its lock.
 
 on:
   push:
@@ -21,7 +17,7 @@ on:
   workflow_dispatch:
 
 env:
-  X_LANG_VERSION: "v0.3.1-rc8"
+  X_LANG_VERSION: "v0.3.1-rc10"
 
 jobs:
   test:
@@ -48,6 +44,21 @@ jobs:
           # Absolute path: the relocatable wrapper resolves its tree from $0.
           echo "$PWD/x-${X_LANG_VERSION}/bin" >> "$GITHUB_PATH"
 
+      # (Pin check) is blocked on x-lang#223: with the project root listed
+      # first (required so the repo's own modules aren't shadowed), the pin
+      # verbs treat "." as the overlay and flag project files as unlisted.
+      # Until that's fixed, verify the vendored tree directly.
+      - name: Overlay matches its lock
+        run: |
+          cat > run-verify.x <<'XEOF'
+          (import x/tool/pin)
+          (display "verify: ") (display (Pin verify "deps"))
+          (newline)
+          XEOF
+          x -f run-verify.x | tee verify-out.txt
+          rm -f run-verify.x
+          grep -qE "verify: [0-9]+" verify-out.txt || { echo "FAIL: overlay drifted from its lock"; exit 1; }
+
       - name: Tests
         run: |
           rc=0
@@ -61,9 +72,8 @@ jobs:
           done
           exit $rc
 
-      - name: The pin was actually armed
+      - name: The pins were actually armed
         run: |
-          x -f tests/pin-proof.x 2> err.txt
-          cat err.txt
+          x -f tests/grid.x 2> err.txt >/dev/null
           grep -q "pinned: "      err.txt || { echo "FAIL: overlay pin not armed"; exit 1; }
           grep -q "pinned boot: " err.txt || { echo "FAIL: boot pin not armed"; exit 1; }
