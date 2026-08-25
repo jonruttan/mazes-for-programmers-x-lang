@@ -1,7 +1,10 @@
-; pin.lock.xon -- generated; do not edit
-(release "v0.3.1-rc10")
-(isa "sha256:8627a521367a0b38ab45678f648336b7857600f368159c56841b1b70889059f0")
-(boot "he.x" "sha256:367406a9ed1e5dbf7d4b8c6ae0a3ad35f6000c95ee061e6e83e290ead0a68d72")
+; deps.lock.xon -- generated; do not edit
+(release "v0.5.1")
+(isa "sha256:b1a4ab9c43b80fc66b072f913b85defa9838d1ccf676ce386598ce9f059132a2")
+(engine-release "v0.1.2")
+(engine-layout "sha256:c1f49438cac61e483fd8ce212dc0085c602b6be525b86c1e15b0551511514bf6")
+(payload "sha256:d91eb310b3e63cdb0e99eb141fc698328e6dbb6941de3837bcf54f56adef5fcf")
+(boot "he.x" "sha256:1e78ee44dfb1c5c3e73f5b4735255f76899aaa338b3bea07f8d63f6b135e2e75")
 (file "x/type/set.x" "sha256:31e196fab30109489083f2454215300771ee6d10b4e93fd904fa111b9b383535")
 (file "x/type/dict.x" "sha256:00911aab1cd2e1efe1974affe01a933d4eb3c72beeaa25bbf064c20b3b1c9c8b")
 (file "x/type/hash.x" "sha256:454c8b204e3f7ebf33a630f087476b13420d7578e0cd872280ba2f5b49445ba9")

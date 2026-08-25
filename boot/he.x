@@ -43,7 +43,52 @@
 ; The base-paths contract + the catalog protocol load FIRST: everything
 ; after them (operatives.x included) fetches its C instruments through
 ; prim-ref, which is pure X -- a first/rest walk over the prims cell.
-; ---- begin tools/contract/base-paths.x ----
+; engine.x is the ONE place the library names its engine: it carries both
+; contract includes (base-paths for the catalog walk, obj-layout for the header
+; offsets) and the engine root the JIT and the pin tool read at runtime.
+; tools/check/engine-seam.sh holds it to being the only such place.
+; ---- begin lib/x/boot/engine.x ----
+; engine.x -- THE ONE PLACE x-lang NAMES ITS ENGINE.
+;
+; x-lang is implementation-agnostic by design: x-engine-c is one engine, and a
+; second implementation should require no edit to the library.  That claim was
+; false in three places -- the boot's two contract includes, the JIT's header
+; search paths, and the pin tool's fingerprint lookup -- each of which spelled
+; `ext/x-engine-c` in its own file.  They are gathered here so the claim has a
+; single seam instead of a scatter, and tools/check/engine-seam.sh holds the line.
+;
+; WHY A LITERAL AND NOT A COMPUTED PATH.  This file loads FIRST, before
+; registry.x, so `prim-ref` does not exist yet and neither does any string
+; operation: there is nothing available to build a path with.  The includes must
+; also stay textually resolvable, because tools/release/amalgamate.sh inlines them
+; by matching `(include "<root>/...")` at the start of a line -- a computed form
+; would travel into the amalgam UNRESOLVED, and an installed tree has no ext/ to
+; find it in later.  That exact bug shipped once during the engine split.
+;
+; So the indirection is deliberately shallow, and it is now in the FILESYSTEM
+; rather than in this file: `engine` is a symlink at the repo root, pointed by
+; the Makefile at whatever engine this tree builds against -- the submodule, a
+; local checkout named by X_ENGINE_DIR, or (phase 4) an unpacked release.  A
+; path can be one thing and mean another, which is the one indirection available
+; to a file that must stay textually resolvable.
+;
+; Choosing an engine is therefore no longer an edit to this file at all.  It was
+; four lines here; now it is where the link points.
+;
+; ORDER: base-paths.x must precede registry.x (the catalog walk reads it), and
+; obj-layout.x must precede data.x (its header offsets).  Both are pure `def`
+; forms over integers and lists -- no dependencies of their own -- so loading them
+; together here, ahead of both consumers, is safe and keeps the seam in one place.
+
+; The engine's root, as DATA, for the consumers that need a path at RUNTIME
+; rather than at include time: lib/x/tool/compile.x builds the JIT's -I flags
+; from it, and lib/x/tool/pin.x reads the engine's ISA manifest through it.
+; Those run long after the library is up, so a value is enough for them; only
+; the includes below need a literal.
+(def %engine-root "engine")
+(def %engine-contract-root "engine/tools/contract")
+
+; ---- begin engine/tools/contract/base-paths.x ----
 ; tools/contract/base-paths.x — every base-object field as a first/rest path.
 ;
 ; SINGLE SOURCE OF TRUTH for reflective navigation of the interpreter state
@@ -181,14 +226,86 @@
   (type-ops type r r r r r r r f f f)
   (type-arg-type base f)
 )))
-; ---- end tools/contract/base-paths.x ----
+; ---- end engine/tools/contract/base-paths.x ----
+; ---- begin engine/tools/contract/obj-layout.x ----
+; tools/contract/obj-layout.x — canonical layout of every object's header words.
+;
+; SINGLE SOURCE OF TRUTH for the object memory contract (the counterpart of
+; tools/contract/base-layout.x, which covers the base pair-tree).  The interpreter is
+; fully reflective -- %obj->ptr + %ptr-ref-word reach every word of every
+; object -- and reflective X code (the ISA-audit migrations) must read its
+; offsets from THIS committed contract, not folklore constants.  Consumed:
+;   1. by X at runtime: plain boot-level defs (only `def` and integers), so
+;      any module or spec may (include "tools/contract/obj-layout.x")
+;   2. tests/x/specs/meta/obj-layout.spec.md -- probes the LIVE build's
+;      objects word by word and fails if reality disagrees with these values
+;   3. tools/check/obj-layout.sh (make check-obj-layout) -- parses the same
+;      values out of ext/x-expr/include/x-obj.h and diffs, so an x-expr bump
+;      that moves the layout fails the build even before anything runs
+;
+; Units are x_obj_t WORDS; multiply by %word-size for byte offsets.
+; VALUES DESCRIBE THE X_HEAP BUILD (every shipped personality): without
+; -DX_HEAP the heap link vanishes (units-heap 0) and later slots shift down.
+;
+; FORMAT (rigid, one entry per line -- the awk parses the same bytes):
+;   (def %obj-<name> <decimal integer>)
+;
+; An object is laid out as:
+;   [meta -N ... meta -1][heap][type][flags][data 0][data 1 ...]
+;                        ^ the object POINTER addresses the heap word
+; Extended metadata (present iff %obj-flag-meta is set in the flags word)
+; is PREPENDED: meta unit I lives at word -(I+1) relative to the object
+; pointer (C: x_obj_meta_i).  Data begins at word %obj-meta-len.
+
+; --- header slots (words, relative to the object pointer) ---
+(def %obj-units-heap 1)   ; heap-chain link; 0 in non-X_HEAP builds
+(def %obj-units-type 1)   ; pointer to the type object (nil for none)
+(def %obj-units-flags 1)  ; the flags bitfield, held as an integer
+(def %obj-slot-heap 0)
+(def %obj-slot-type 1)
+(def %obj-slot-flags 2)
+(def %obj-meta-len 3)     ; header length = the word where data begins
+
+; --- data shapes (words, relative to data start) ---
+(def %obj-units-atom 1)   ; atom: the value word (int / str ptr / char)
+(def %obj-units-pair 2)   ; pair: first at data 0, rest at data 1
+(def %obj-slot-first 0)
+(def %obj-slot-rest 1)
+
+; --- flags word bits (decimal; hex noted in comments) ---
+; Low nibble: general-purpose attribute bits.  Their MEANING is per-type:
+; flag-1 is WRAP on procedures (wrapped applicative) and SHADOW on env
+; pairs; flag-2 is COV.  The x-eval layer owns those aliases.
+(def %obj-flag-attr-mask 15)    ; 0x0F
+(def %obj-flag-1 1)             ; 0x01  WRAP / SHADOW
+(def %obj-flag-2 2)             ; 0x02  COV
+(def %obj-flag-3 4)             ; 0x04
+(def %obj-flag-4 8)             ; 0x08
+; Simple-type code (advisory tag for C consumers; NOT the type slot)
+(def %obj-flag-simple-type 16)  ; 0x10  marker bit: a simple-type code follows
+(def %obj-flag-prim 16)         ; 0x10
+(def %obj-flag-fn 17)           ; 0x11
+(def %obj-flag-int 18)          ; 0x12
+(def %obj-flag-char 19)         ; 0x13
+(def %obj-flag-str 20)          ; 0x14
+(def %obj-flag-ptr 21)          ; 0x15
+(def %obj-flag-type-mask 240)   ; 0xF0
+; Independent attribute bits
+(def %obj-flag-own 32)          ; 0x20  object owns its (string) storage
+(def %obj-flag-ro 64)           ; 0x40  read-only
+(def %obj-flag-meta 128)        ; 0x80  extended meta units prepended
+; X_HEAP-only bits
+(def %obj-flag-shared 256)      ; 0x100
+(def %obj-flag-mark 512)        ; 0x200  the GC mark bit (was %obj-flag-heap pre-B1)
+; ---- end engine/tools/contract/obj-layout.x ----
+; ---- end lib/x/boot/engine.x ----
 ; ---- begin lib/x/boot/registry.x ----
 ; registry.x -- the primitives-catalog protocol, pure X (bootstrap stage 0)
 ;
 ; The FIRST file x-core loads: everything after it -- operatives.x included
 ; -- fetches its C instruments with prim-ref, so the protocol must exist
 ; before any other X code runs.  It can: the catalog is just a cell in the
-; base spine (tools/contract/base-paths.x, included immediately before this file),
+; base spine (engine/tools/contract/base-paths.x, included immediately before this file),
 ; and reading it is a pure first/rest walk from (%base).  Uses ONLY the C
 ; spine forms (fn/def/match/lit + first/rest/eq?).
 ;
@@ -331,78 +448,6 @@
 
 (def begin do)
 ; ---- end lib/x/boot/operatives.x ----
-; The object-layout contract: header offsets data.x and reflect.x build on.
-; ---- begin tools/contract/obj-layout.x ----
-; tools/contract/obj-layout.x — canonical layout of every object's header words.
-;
-; SINGLE SOURCE OF TRUTH for the object memory contract (the counterpart of
-; tools/contract/base-layout.x, which covers the base pair-tree).  The interpreter is
-; fully reflective -- %obj->ptr + %ptr-ref-word reach every word of every
-; object -- and reflective X code (the ISA-audit migrations) must read its
-; offsets from THIS committed contract, not folklore constants.  Consumed:
-;   1. by X at runtime: plain boot-level defs (only `def` and integers), so
-;      any module or spec may (include "tools/contract/obj-layout.x")
-;   2. tests/x/specs/meta/obj-layout.spec.md -- probes the LIVE build's
-;      objects word by word and fails if reality disagrees with these values
-;   3. tools/check/obj-layout.sh (make check-obj-layout) -- parses the same
-;      values out of ext/x-expr/include/x-obj.h and diffs, so an x-expr bump
-;      that moves the layout fails the build even before anything runs
-;
-; Units are x_obj_t WORDS; multiply by %word-size for byte offsets.
-; VALUES DESCRIBE THE X_HEAP BUILD (every shipped personality): without
-; -DX_HEAP the heap link vanishes (units-heap 0) and later slots shift down.
-;
-; FORMAT (rigid, one entry per line -- the awk parses the same bytes):
-;   (def %obj-<name> <decimal integer>)
-;
-; An object is laid out as:
-;   [meta -N ... meta -1][heap][type][flags][data 0][data 1 ...]
-;                        ^ the object POINTER addresses the heap word
-; Extended metadata (present iff %obj-flag-meta is set in the flags word)
-; is PREPENDED: meta unit I lives at word -(I+1) relative to the object
-; pointer (C: x_obj_meta_i).  Data begins at word %obj-meta-len.
-
-; --- header slots (words, relative to the object pointer) ---
-(def %obj-units-heap 1)   ; heap-chain link; 0 in non-X_HEAP builds
-(def %obj-units-type 1)   ; pointer to the type object (nil for none)
-(def %obj-units-flags 1)  ; the flags bitfield, held as an integer
-(def %obj-slot-heap 0)
-(def %obj-slot-type 1)
-(def %obj-slot-flags 2)
-(def %obj-meta-len 3)     ; header length = the word where data begins
-
-; --- data shapes (words, relative to data start) ---
-(def %obj-units-atom 1)   ; atom: the value word (int / str ptr / char)
-(def %obj-units-pair 2)   ; pair: first at data 0, rest at data 1
-(def %obj-slot-first 0)
-(def %obj-slot-rest 1)
-
-; --- flags word bits (decimal; hex noted in comments) ---
-; Low nibble: general-purpose attribute bits.  Their MEANING is per-type:
-; flag-1 is WRAP on procedures (wrapped applicative) and SHADOW on env
-; pairs; flag-2 is COV.  The x-eval layer owns those aliases.
-(def %obj-flag-attr-mask 15)    ; 0x0F
-(def %obj-flag-1 1)             ; 0x01  WRAP / SHADOW
-(def %obj-flag-2 2)             ; 0x02  COV
-(def %obj-flag-3 4)             ; 0x04
-(def %obj-flag-4 8)             ; 0x08
-; Simple-type code (advisory tag for C consumers; NOT the type slot)
-(def %obj-flag-simple-type 16)  ; 0x10  marker bit: a simple-type code follows
-(def %obj-flag-prim 16)         ; 0x10
-(def %obj-flag-fn 17)           ; 0x11
-(def %obj-flag-int 18)          ; 0x12
-(def %obj-flag-char 19)         ; 0x13
-(def %obj-flag-str 20)          ; 0x14
-(def %obj-flag-ptr 21)          ; 0x15
-(def %obj-flag-type-mask 240)   ; 0xF0
-; Independent attribute bits
-(def %obj-flag-own 32)          ; 0x20  object owns its (string) storage
-(def %obj-flag-ro 64)           ; 0x40  read-only
-(def %obj-flag-meta 128)        ; 0x80  extended meta units prepended
-; X_HEAP-only bits
-(def %obj-flag-shared 256)      ; 0x100
-(def %obj-flag-mark 512)        ; 0x200  the GC mark bit (was %obj-flag-heap pre-B1)
-; ---- end tools/contract/obj-layout.x ----
 ; ---- begin lib/x/boot/data.x ----
 ; data.x -- Pair and data accessors (bootstrap)
 ;
@@ -418,7 +463,7 @@
 (def %int->ptr (prim-ref (lit int) (lit ->ptr)))
 
 ; %word-size and %data-offset computed once at boot; the header length comes
-; from the committed layout contract (tools/contract/obj-layout.x, included by
+; from the committed layout contract (engine/tools/contract/obj-layout.x, included by
 ; x-core.x just before this file).
 (def %word-size
   (match
@@ -435,7 +480,6 @@
 ; coherence (one addressing definition) AND faster than re-computing
 ; (+ %data-offset %word-size) on every accessor call.
 (def %data-off-0 (%data-word-off 0))
-(def %data-off-1 (%data-word-off 1))
 
 ; Data-slot write, pure reflection: the stored word is the value's object
 ; pointer.  Formerly the C (obj set!) prim -- boot/reflect.x files this
@@ -449,17 +493,20 @@
 (def %set-first! (fn (_ p v) (%obj-set! p 0 v) p))
 (def %set-rest! (fn (_ p v) (%obj-set! p 1 v) p))
 
-; Int variants: read/write raw integer from pair slots
-(def %first-int (fn (_ x) (%ptr-ref-word (%obj->ptr x) %data-off-0)))
-(def %rest-int (fn (_ x) (%ptr-ref-word (%obj->ptr x) %data-off-1)))
-(def %set-first-int! (fn (_ p v) (%ptr-set-word! (%obj->ptr p) %data-off-0 v) p))
-(def %set-rest-int! (fn (_ p v) (%ptr-set-word! (%obj->ptr p) %data-off-1 v) p))
+; Int cells: read/write a raw machine integer in an object's first data
+; word.  Reshaped from a pair-style first/rest accessor quartet (#231):
+; every caller is a single-slot int CELL (the C-written sigint flag,
+; reflect's counters, the profiler spine leaves), so the rest-slot half
+; never had a caller -- the pair framing was the wrong shape, not the
+; unused half an accident.
+(def %cell-int (fn (_ x) (%ptr-ref-word (%obj->ptr x) %data-off-0)))
+(def %set-cell-int! (fn (_ p v) (%ptr-set-word! (%obj->ptr p) %data-off-0 v) p))
 ; ---- end lib/x/boot/data.x ----
 ; ---- begin lib/x/boot/reflect.x ----
 ; reflect.x -- reflective object accessors over the layout contract (bootstrap)
 ;
 ; The interpreter is fully reflective: %obj->ptr + the ptr word ops reach
-; every word of every object, and tools/contract/obj-layout.x (included by x-core.x
+; every word of every object, and engine/tools/contract/obj-layout.x (included by x-core.x
 ; before data.x) commits the offsets.  These accessors REPLACE the C prims
 ; of the same catalog names -- the C table rows are deleted and the ISA
 ; keeps only the load/store instructions -- filed with prim-reg! so every
@@ -528,12 +575,12 @@
 ; int ATOM; its value is the atom's data word (first-int/set-first-int!).
 ; meta-count! returns the PREVIOUS count (C contract).
 (def %reflect-meta-count
-  (fn (_) (%first-int (first %reflect-meta-extra-cell))))
+  (fn (_) (%cell-int (first %reflect-meta-extra-cell))))
 (def %reflect-meta-count!
   (fn (_ n)
     (do
-      (def %reflect-prev-extra (%first-int (first %reflect-meta-extra-cell)))
-      (%set-first-int! (first %reflect-meta-extra-cell) n)
+      (def %reflect-prev-extra (%cell-int (first %reflect-meta-extra-cell)))
+      (%set-cell-int! (first %reflect-meta-extra-cell) n)
       %reflect-prev-extra)))
 
 ; (io error-line) / (io error-file) -- the source location FROZEN at the last
@@ -548,7 +595,7 @@
 (def %reflect-err-file-cell      (%reflect-base-cell (lit err-file)))
 (def %reflect-file-registry-cell (%reflect-base-cell (lit file-registry)))
 (def %reflect-error-line
-  (fn (_) (%first-int (first %reflect-err-line-cell))))
+  (fn (_) (%cell-int (first %reflect-err-line-cell))))
 ; Walk the (id . path) alist for `id`, returning its path string; "" when the
 ; id is absent (0, or never registered).  Int equality via (- a b) then the
 ; proven (eq? <int> 0) zero-test -- eq? on two int atoms is not relied upon.
@@ -556,12 +603,12 @@
   (fn (self id reg)
     (match
       ((eq? reg ()) "")
-      ((eq? (- (%first-int (first (first reg))) id) 0) (rest (first reg)))
+      ((eq? (- (%cell-int (first (first reg))) id) 0) (rest (first reg)))
       (#t (self id (rest reg))))))
 (def %reflect-error-file
   (fn (_)
     (%reflect-registry-lookup
-      (%first-int (first %reflect-err-file-cell))
+      (%cell-int (first %reflect-err-file-cell))
       (first %reflect-file-registry-cell))))
 
 ; --- type reflection ---
@@ -627,7 +674,12 @@
 ; C branches exactly: a bare atom / structural pair is a type HANDLE,
 ; resolved against the type-alist (its own type field holds a sentinel, so
 ; navigating it would misread the tag payload); nil-typed objects have no
-; name; anything else reads its type tree's name field.
+; name; a NON-navigable type tag -- an ATOM sentinel like the base tag
+; x_eval_obj ("BASE"), never a registered pair tree -- answers its own
+; bytes (C returned the raw tag; x_type_prim_type_name's "must not be
+; navigated" rule): stepping the name path through an atom with the
+; UNCHECKED first/rest is a segfault, which is exactly how printing a
+; (base make) child died; anything else reads its type tree's name field.
 (def %reflect-name-str
   (fn (_ n)
     (match
@@ -650,9 +702,13 @@
           (match
             ((%reflect-handle-tw? %reflect-twd) (%reflect-handle-name o))
             ((eq? %reflect-twd 0) ())
-            (#t (%reflect-name-str
-                  (%reflect-type-tree-name
-                    (%ptr->obj (%int->ptr %reflect-twd)))))))))))
+            (#t
+              (do
+                (def %reflect-tt (%ptr->obj (%int->ptr %reflect-twd)))
+                (match
+                  ((eq? (%reflect-type-word %reflect-tt) %reflect-spair-tw)
+                    (%reflect-name-str (%reflect-type-tree-name %reflect-tt)))
+                  (#t (%reflect-name-str %reflect-tt)))))))))))
 
 ; (iter new o) -- fetch the iter handler from o's type tree (descriptor
 ; path type-iter) and apply it to o; nil for nil-typed/sentinel-typed
@@ -795,7 +851,7 @@
       (#t
         (do
           (%print-emit "#<ATOM:0x")
-          (%print-emit (%number->str (%first-int o) 16))
+          (%print-emit (%number->str (%cell-int o) 16))
           (%print-emit ">"))))))
 ; Bounded opaque form for handler-less cell-typed instances: only the
 ; header-derived type NAME is read, never a data word.
@@ -1007,7 +1063,7 @@
 ; fronts because handlers and walkers reference them.  `self` is the
 ; recursion knot -- children render in the SAME mode.
 ; Booleans by same? (object identity), NEVER eq?: eq? compares value words,
-; and any scalar whose word collides with #t's -- e.g. (%first-int #t) -- would
+; and any scalar whose word collides with #t's -- e.g. (%cell-int #t) -- would
 ; render as a boolean.  #t/#f are singletons, so identity is exact (mirrors
 ; C's pointer compare against the base true/false objects).
 (def %print-render
@@ -1192,6 +1248,53 @@
 (prim-reg! (lit io) (lit write)          %print-write1)
 (prim-reg! (lit io) (lit display-to-str) (fn (_ o) (%print-to-str o %print-d)))
 (prim-reg! (lit io) (lit write-to-str)   (fn (_ o) (%print-to-str o %print-w)))
+; --- bounded rendering: "does this form fit in N columns?" -------------
+; The question needs no TEXT, only a COUNT, so the sink COUNTS instead of
+; collecting -- which drops both the parts list and the join that dominate
+; write-to-str -- and ABORTS the render the moment the limit is reached, so
+; the walk is bounded by N instead of by the form's size.
+;
+; fmt asks this once per list node, and used to ask it by rendering the
+; whole subtree through write-to-str and measuring the result -- so every
+; subtree was re-rendered once per ancestor.  Measured on lib/x/tool/pin.x
+; (1042 lines): 30s and ~450M allocations, which is OVER the 300M
+; alloc-guard ceiling, so the formatter could not finish the file at all.
+; With this door: 10s and ~150M, same output byte for byte.
+;
+; Counting is CODE POINTS, matching the column math everywhere else (bytes
+; misalign non-ASCII source).  The one-byte shortcut is exact -- in valid
+; UTF-8 a single byte is a single code point -- and skips the ambient
+; string-call dispatch for the "(", ")" and " " chunks that dominate the
+; emit stream.  Counting BYTES alone measured faster still (7s) but is only
+; conservative: bytes >= code points, so it would wrap a non-ASCII form that
+; would have fit.
+;
+; Helpers and state ride the registration closure rather than new globals:
+; the %-budget is shrink-only, and a per-call helper would allocate once per
+; node.  `let` bindings are per-activation, so a nested ask (a fits? inside a
+; to-str capture, or inside another fits?) keeps its own counter -- the
+; hazard %print-to-str-run's parameter-riding comment describes.
+(prim-reg! (lit io) (lit write-fits?)
+  ; `let` is not bound yet at this point in boot (core/syntax.x is far
+  ; below), so the bindings are immediately-applied fns -- which is what
+  ; let desugars to, and which puts the counter and the saved sink on
+  ; PARAMETERS, the per-activation home this file's to-str comment
+  ; requires: a nested ask keeps its own counter.
+  ((fn (_ len)
+     (fn (_ o limit)
+       ((fn (_ n old)
+          (do
+            (%set-first! %print-sink
+              (fn (_ s)
+                (do (%set-first! n (%print-int+ (first n) (len s)))
+                    (if (< (first n) limit) () (error (lit %print-overflow))))))
+            (guard (e (do (%set-first! %print-sink old)
+                          (if (%print-same? e (lit %print-overflow)) #f (error e))))
+              (do (%print-w o)
+                  (%set-first! %print-sink old)
+                  (< (first n) limit)))))
+        (pair 0 ()) (first %print-sink))))
+   (fn (_ s) (if (= (%print-byte-len s) 1) 1 (s)))))
 ; The bare verbs: write is unary; display is variadic (the shape the old
 ; string.x shim over the retired C prim established).
 ; The bare verbs are OPS, not fns: the repl's print seat calls them between
@@ -1241,7 +1344,7 @@
 ; call -- so they stay byte-level even when a code-point handler is pushed on
 ; the string call, and every caller built on them (str=?, str->number, readers)
 ; stays byte-safe automatically. Use the bare (s i) call for the ambient
-; protocol, or the Str8 / StrUTF8 classes for an explicit one.
+; protocol, or the Str8 / StrUtf8 classes for an explicit one.
 (def %str-ref %str-byte-ref)
 (def %str-length %str-byte-len)
 (def %substring (fn (_ s start end) (%str-byte-sub s start (- end start))))
@@ -1265,6 +1368,63 @@
       ((= (%str-byte-len a) (%str-byte-len b))
         (eq? 0 (%mem-cmp (%str->ptr a) (%str->ptr b) (%str-byte-len a))))
       (#t #f))))
+
+; %str-concat: join a LIST of strings -- ONE allocation, one (mem copy)
+; per piece, O(total bytes) (#333).  The append-accumulate idiom this
+; replaces re-copied the whole accumulator per piece (O(n^2) in output
+; size); every multi-piece builder in the library (join, interpolation,
+; the codec emitters, replace) funnels here now.  GC-safe on the str=?
+; grounds: collection is explicit-only, %out stays a live binding for
+; the whole walk, and each raw ptr is derived and consumed with no
+; collect possible in between.
+(def %int->ptr (prim-ref (lit int) (lit ->ptr)))
+; C arithmetic, fetched once: this runs per PIECE, and the ambient
+; ops are the tower dispatchers by the time any caller runs (~92
+; objects per op vs ~5 raw -- the %n2s lesson, re-learned by benchmark:
+; the block path lost to the fold it replaces until these landed).
+(def %sc-int+ (prim-ref (lit int) (lit +)))
+(def %sc-int< (prim-ref (lit int) (lit <)))
+(def %ptr->int (prim-ref (lit ptr) (lit ->int)))
+(def %mem-copy (prim-ref (lit mem) (lit copy)))
+(def %str-make (prim-ref (lit str) (lit make)))
+; HYBRID, measured and derived (2026-08-19): the fold arm costs
+; total*n/2 bytes of C memcpy, the block arm ~15us of prim overhead per
+; piece -- the n cancels and the crossover is TOTAL OUTPUT alone,
+; ~300KB on the measured machine (a 330KB join ties).  Below the
+; threshold the fold's memcpy constant wins (a 2000-piece 8KB join
+; measured 6x faster there than the block path); above it the fold is
+; quadratic without bound while the block stays linear -- the old
+; unconditional fold OOM-pressured at ~2GB copied for what is now one
+; 300KB pass.  Both arms produce identical bytes; the threshold only
+; trades constants.
+(def %str-concat
+  (fn (_ pieces)
+    (do
+      (def %sc-total
+        ((fn (self ps n)
+           (match
+             ((null? ps) n)
+             (#t (self (rest ps) (%sc-int+ n (%str-byte-len (first ps)))))))
+         pieces 0))
+      (match
+        ((%sc-int< %sc-total 262144)
+          ((fn (self ps acc)
+             (match
+               ((null? ps) acc)
+               (#t (self (rest ps) (%str-append acc (first ps))))))
+           pieces ""))
+        (#t
+          (do
+            (def %out (%str-make %sc-total))
+            (def %sc-base (%ptr->int (%str->ptr %out)))
+            ((fn (self ps off)
+               (match
+                 ((null? ps) %out)
+                 (#t (do
+                       (def %sc-n (%str-byte-len (first ps)))
+                       (%mem-copy (%int->ptr (%sc-int+ %sc-base off)) (%str->ptr (first ps)) %sc-n)
+                       (self (rest ps) (%sc-int+ off %sc-n))))))
+             pieces 0)))))))
 
 ; number->str: (number->str n [radix]) -> string
 (def %n2s/ /)
@@ -1400,6 +1560,9 @@
 ; ---- end lib/x/boot/string.x ----
 ; ---- begin lib/x/boot/module.x ----
 ; module.x -- Include-once and module system (bootstrap)
+; lint-known: dirent-names
+; (x/platform/dirent, imported at CALL time in %module-list-dir --
+;  the same lazy-import pattern as the syscall table)
 ;
 ; Provides include-once, require-once, provide, import.
 ; Last bootstrap file — after this, normal modules can use provide/import.
@@ -1408,8 +1571,20 @@
 ; Fetch the string prims from the catalog (ns `str` is de-registered, R5).
 (def %str-append (prim-ref (lit str) (lit append)))
 
-(def %io-state (rest (first (rest (first (%base))))))
-(def %false-stack (rest (rest %io-state)))
+; THE COMMITTED ROUTES, not a hand-walked chain.  Both of these used to spell
+; their steps out -- (rest (first (rest (first (%base))))) and two more rests --
+; which silently assumed x-engine-c's base layout.  On an engine that arranges
+; its base differently the steps land on an unrelated cell, and the %set-rest!
+; below then WRITES there: booting x-engine-rust turned #f truthy, because the
+; extension scribbled past an object that had no room for it.
+;
+; Decision L1 says the layout travels with the engine and only the NAMES are the
+; contract, so a literal walk is the one thing the library may not do.  Every
+; route named here is one x-engine-c already declared -- the names existed all
+; along; these three lines simply were not using them.
+; %io-state itself is no longer read: it existed only as a waypoint on the way
+; to the false cell, which is now resolved directly.
+(def %false-stack (%reflect-base-cell (lit false)))
 (%set-rest! %false-stack (pair () ()))
 (def %include-list-cell (rest %false-stack))
 
@@ -1446,6 +1621,13 @@
     (%go 0 -1)))
 
 ; Directory part of a path: everything before the last "/", or "." if none.
+; BOOT-CONSTRAINED twins of (Path dirname)/(Path join) -- this file
+; loads before the class layer, so it cannot ride x/type/path.  The
+; SEMANTICS INTENTIONALLY DIVERGE and callers rely on it: %path-dir
+; does not strip trailing slashes or special-case the root, and
+; %path-join returns part UNCHANGED for dir "." or "" where (Path join)
+; would emit "./part" -- rel paths built here key lockfiles and the
+; module registry, so the bytes are the contract (#225).
 (def %path-dir
   (fn (_ p)
     (def slash (%last-slash p))
@@ -1853,42 +2035,15 @@
           ((eq? (first (first lst)) name) (first (rest (first lst))))
           (#t (self (rest lst))))))
     (%go %file-modes)))
-(def %module-u16
-  (fn (_ buf i)
-    (+ (%str-byte-ref buf i) (* 256 (%str-byte-ref buf (+ i 1))))))
-(def %module-dirent-name
-  ; NUL-terminated name in buf between start and end.
-  (fn (_ buf start end)
-    (def %go
-      (fn (self i)
-        (match
-          ((= i end) i)
-          ((= (%str-byte-ref buf i) 0) i)
-          (#t (self (+ i 1))))))
-    (%substring buf start (%go start))))
-(def %module-dirents
-  ; One getdents batch buffer -> entry names onto acc.  Name offset 19 on
-  ; Linux (dirent64), 21 on Darwin (namlen u16@18); reclen u16@16 on both.
-  (fn (_ buf n acc)
-    (def %name-off (match (os-darwin? 21) (#t 19)))
-    (def %go
-      (fn (self off acc)
-        (match
-          ((< off n)
-            (do
-              (def %reclen (%module-u16 buf (+ off 16)))
-              (match
-                ((= %reclen 0) acc)
-                (#t (self (+ off %reclen)
-                          (pair (%module-dirent-name buf (+ off %name-off)
-                                                     (+ off %reclen))
-                                acc))))))
-          (#t acc))))
-    (%go 0 acc)))
 (def %module-list-dir
-  ; Entry names in dir; a dir that cannot be opened is no entries.
+  ; Entry names in dir; a dir that cannot be opened is no entries (a
+  ; DELIBERATE boot policy -- resolution probes absent roots), but a
+  ; read error mid-scan is an ERROR: folding it into EOF silently
+  ; changed which module version resolved (#228).  "." and ".." are
+  ; rejected here, not in the decoder, mirroring file.x's split.
   (fn (_ dir)
     (import x/platform/syscall)
+    (import x/platform/dirent)
         ; Three args always, like sys/file.x: the kernel ignores the perm
     ; unless O_CREAT is set, and the prim's call shape stays uniform.
     (def %fd (syscall (syscall-id (lit open)) dir (%module-mode (lit rdonly)) 420))
@@ -1906,11 +2061,21 @@
                   (syscall (syscall-id (lit getdirentries64)) %fd %buf 4096 %basep))
                 (#t (syscall (syscall-id (lit getdents64)) %fd %buf 4096))))
             (match
-              ((< %n 1) acc)
-              (#t (self (%module-dirents %buf %n acc))))))
+              ((< %n 0)
+                (do (syscall (syscall-id (lit close)) %fd)
+                    (error (%str-append "module list-dir: directory read failed: " dir))))
+              ((= %n 0) acc)
+              (#t (self (dirent-names %buf %n acc))))))
           (def %names (%go ()))
           (syscall (syscall-id (lit close)) %fd)
-          %names)))))
+          (def %keep
+            (fn (self lst acc)
+              (match
+                ((eq? lst ()) acc)
+                ((str=? (first lst) ".") (self (rest lst) acc))
+                ((str=? (first lst) "..") (self (rest lst) acc))
+                (#t (self (rest lst) (pair (first lst) acc))))))
+          (%keep %names ()))))))
 (def %module-scan-dir
   ; All (version-tuple . filename) candidates for base in dir, bare included
   ; as version ().  A missing or unreadable directory is no candidates.
@@ -2058,7 +2223,7 @@
             (#t (%module-check-imports name syms (rest %entry)))))))))
 ; ---- end lib/x/boot/module.x ----
 
-(def x-lib-version "0.3.0")
+(def x-lib-version "0.5.1")
 
 ; Pre-register all boot module NAMES so import calls are no-ops.
 ; INVARIANT (machine-checked by make check-boot-order): every lib module
@@ -2070,6 +2235,7 @@
 ; reader sugar is not loaded yet at this point in boot.
 (%set-first! %module-loaded-cell
   (pair (lit x-core)
+  (pair (lit x/boot/engine)
   (pair (lit x/boot/registry)
   (pair (lit x/boot/operatives)
   (pair (lit x/boot/data)
@@ -2106,6 +2272,7 @@
   (pair (lit x/type/vector)
   (pair (lit x/type/promise)
   (pair (lit x/type/class)
+  (pair (lit x/type/record)
   (pair (lit x/protocol/seq)
   (pair (lit x/protocol/str/str8)
   (pair (lit x/protocol/str/utf8)
@@ -2114,7 +2281,7 @@
   (pair (lit x/type/base)
   (pair (lit x/type/list)
   (pair (lit x/type/gen)
-  (pair (lit x/reader/token)
+  (pair (lit x/reader/analyser)
   (pair (lit x/core/quasi)
   (pair (lit x/reader/quasi-reader)
   (pair (lit x/reader/lit-reader)
@@ -2124,7 +2291,7 @@
   (pair (lit x/type/err)
   (pair (lit x/repl/ansi)
   (pair (lit x/repl/banner)
-    (first %module-loaded-cell)))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+    (first %module-loaded-cell)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
 
 ; --- Standard modules ---
 ; ---- begin lib/x/core/predicates.x ----
@@ -2174,8 +2341,6 @@
 ; their arguments unevaluated, so procedure? deliberately excludes them.
 (def operative? (fn (_ x) (%type? x %type-op)))
 
-; Source line of an object (0 if no metadata)
-(def %line-of (fn (_ obj) (%obj-meta-ref obj 0)))
 
 ; NOTE: this module loads before the doc system (x/doc/doc.x), so it cannot
 ; wrap its provide in (doc ...). Its module description is registered
@@ -2260,7 +2425,7 @@
 
 ; --- Type struct navigation ---
 ; Every walk below is derived at MODULE LOAD from the committed layout
-; descriptor (tools/contract/base-paths.x) via registry.x's walker -- a layout
+; descriptor (engine/tools/contract/base-paths.x) via registry.x's walker -- a layout
 ; change follows the contract automatically; nothing here re-flattens the
 ; tree by hand.  Group accessors resolve their row's full step list; each
 ; *-cell resolves the PARENT of the row naming the value it fronts (via
@@ -2438,8 +2603,12 @@
 ;   (%type-push-op ts (lit +) (fn (_ a b) ...))
 ; The C operators (+ - * / % = <) dispatch here when EXACTLY ONE operand is a
 ; typed instance; the handler receives the raw operands and owns coercing the
-; plain side. (Mixed typed/typed dispatch is an open design question -- the
-; cvt from-alists declare the cross-type relation.) Prepend semantics: a
+; plain side. (Mixed typed/typed dispatch: C arbitrates by the cvt
+; from-alists -- the absorbing side's handler wins -- and the tower's policy
+; layer, x/num/tower, promotes through the same lattice at the generic
+; level; docs/object-system.md "One model, four doors" is the ruling
+; record. A pair NEITHER side declares still falls through to raw C at
+; this door -- the recorded bigint x rational residual.) Prepend semantics: a
 ; re-registration shadows the older handler. This replaces set!-wrapping the
 ; global operators -- types register ops; nothing wraps ambient names.
 (def %type-push-op
@@ -2858,32 +3027,27 @@
 (def %display-notes
   (fn (_ notes)
     (%doc-for-each
-      (fn (_ n) (display "  ") (display %c-dim) (display n) (display %c-reset) (newline))
+      (fn (_ n) (display "  " %c-dim n %c-reset "\n"))
       notes)))
 
 (def %display-params
   (fn (self ps)
     (if (null? ps) ()
       (do
-        (display "  ")
-        (display %c-param) (display (first (first ps))) (display %c-reset)
+        (display "  " %c-param (first (first ps)) %c-reset)
         (if (not (null? (first (rest (first ps)))))
-          (do (display " : ")
-              (display %c-type) (display (first (rest (first ps)))) (display %c-reset)))
+          (do (display " : " %c-type (first (rest (first ps))) %c-reset)))
         (if (not (str=? (first (rest (rest (first ps)))) ""))
-          (do (display " -- ")
-              (display (first (rest (rest (first ps)))))))
+          (do (display " -- " (first (rest (rest (first ps)))))))
         (newline)
         (self (rest ps))))))
 
 (def %display-returns
   (fn (_ ret)
     (if (not (null? ret))
-      (do (display "  => ")
-          (display %c-type) (display (first ret)) (display %c-reset)
+      (do (display "  => " %c-type (first ret) %c-reset)
           (if (not (str=? (first (rest ret)) ""))
-            (do (display " -- ")
-                (display (first (rest ret)))))
+            (do (display " -- " (first (rest ret)))))
           (newline)))))
 
 (def %display-examples
@@ -2892,15 +3056,13 @@
       (fn (_ ex)
         (display "  > ")
         (%highlight-code (first ex))
-        (display " => ")
-        (display (rest ex))
-        (newline))
+        (display " => " (rest ex) "\n"))
       examples)))
 
 (def %display-sees
   (fn (_ sees)
     (%doc-for-each
-      (fn (_ ref) (display "  See: ") (display ref) (newline))
+      (fn (_ ref) (display "  See: " ref "\n"))
       sees)))
 
 ; Print a coloured name at an indent: `<indent>%c-name<name>%c-reset`.  name
@@ -2909,7 +3071,7 @@
 ; modules' load status).
 (def %display-name
   (fn (_ indent name)
-    (display indent) (display %c-name) (display name) (display %c-reset)))
+    (display indent %c-name name %c-reset)))
 
 ; Print one "<name> -- <desc>" listing line (description omitted when empty),
 ; then a newline.  The single formatter every name+desc listing routes through
@@ -2919,7 +3081,7 @@
   (fn (_ indent name desc)
     (%display-name indent name)
     (if (not (str=? desc ""))
-      (do (display " -- ") (display desc)))
+      (do (display " -- " desc)))
     (newline)))
 
 ; --- Display ---
@@ -2942,13 +3104,11 @@
 
 (def %display-doc
   (fn (_ entry)
-    (display %c-name) (display (%doc-entry-name entry)) (display %c-reset)
-    (display ": ")
-    (display (%doc-entry-desc entry))
-    (newline)
+    (display %c-name (%doc-entry-name entry) %c-reset ": "
+             (%doc-entry-desc entry) "\n")
     (def %mod (%module-for-sym (%doc-entry-name entry)))
     (if (not (null? %mod))
-      (do (display "  module: ") (display %c-module) (display %mod) (display %c-reset) (newline)))
+      (do (display "  module: " %c-module %mod %c-reset "\n")))
     (%display-notes (%doc-entry-notes entry))
     (%display-params (%doc-entry-params entry))
     (%display-returns (%doc-entry-returns entry))
@@ -2979,7 +3139,7 @@
           (if (null? %e) "" (%doc-entry-desc %e)))
         ; if sym names a class, expand its documented methods underneath.
         ; Only expand under the class's CANONICAL name, so aliases (e.g. Str,
-        ; Str -> StrUTF8) stay collapsed instead of repeating the whole list.
+        ; Str -> StrUtf8) stay collapsed instead of repeating the whole list.
         (def %v (guard (_ ()) (eval sym e)))
         (if (if (null? %v) #f
               (if (class? %v)
@@ -2992,15 +3152,13 @@
 
 (def %display-overview
   (fn (_ )
-    (display %c-bold) (display "x-lang help system") (display %c-reset) (newline)
-    (newline)
-    (display "  (help)          show this overview") (newline)
-    (display "  (help name)     docs for a function or operative") (newline)
-    (display "  (help module)   list a module's exports") (newline)
-    (display "  (modules)       list all available modules") (newline)
-    (display "  (apropos \"str\") search by name substring") (newline)
-    (newline)
-    (display %c-bold) (display "Modules:") (display %c-reset) (newline)
+    (display %c-bold "x-lang help system" %c-reset "\n\n"
+             "  (help)          show this overview\n"
+             "  (help name)     docs for a function or operative\n"
+             "  (help module)   list a module's exports\n"
+             "  (modules)       list all available modules\n"
+             "  (apropos \"str\") search by name substring\n\n" %c-bold
+             "Modules:" %c-reset "\n")
     (%doc-for-each
       (fn (_ m)
         (def %md (%doc-lookup (first m)))
@@ -3010,13 +3168,6 @@
       (List sort
         (fn (_ a b) (%str-lt (symbol->str (first a)) (symbol->str (first b))))
         (first %module-registry-cell)))))
-
-; True if the string x appears in the list of strings lst.
-(def %member-str?
-  (fn (self x lst)
-    (if (null? lst) #f
-      (if (str=? x (first lst)) #t
-        (self x (rest lst))))))
 
 ; Walk a class's chain looking up "<class>/method" docs; return the first hit
 ; (most-derived wins), or nil. Lets (help Class method) find inherited methods.
@@ -3033,13 +3184,20 @@
 ; --- Class help: members/methods grouped static vs instance, sorted, merged ---
 
 ; Lexicographic byte compare of two strings (sorts member/method names).
+; Lengths hoisted above the walk (#338): the old loop recomputed both
+; on every character inside a sort comparator.
 (def %str<?
-  (fn (loop a b i)
-    (if (>= i (%str-length a)) (< (%str-length a) (%str-length b))
-      (if (>= i (%str-length b)) #f
-        (let ((ca (%char->integer (%str-ref a i)))
-              (cb (%char->integer (%str-ref b i))))
-          (if (< ca cb) #t (if (> ca cb) #f (loop a b (+ i 1)))))))))
+  (fn (_ a b i)
+    (def la (%str-length a))
+    (def lb (%str-length b))
+    (def go
+      (fn (loop i)
+        (if (>= i la) (< la lb)
+          (if (>= i lb) #f
+            (let ((ca (%char->integer (%str-ref a i)))
+                  (cb (%char->integer (%str-ref b i))))
+              (if (< ca cb) #t (if (> ca cb) #f (loop (+ i 1)))))))))
+    (go i)))
 
 ; #t if symbol x is in the list of symbols lst.
 (def %member-sym?
@@ -3092,7 +3250,7 @@
   (fn (_ label entries indent)
     (if (null? entries) ()
       (do
-        (display indent) (display label) (newline)
+        (display indent label "\n")
         (%display-entries entries (%str-append indent "  "))))))
 
 ; Print a class's members + methods, grouped static vs instance, at `base` indent.
@@ -3106,7 +3264,7 @@
       (do
         (if (if (null? s-mem) (null? s-meth) #f) ()    ; static: only if non-empty
           (do
-            (display base) (display "static:") (newline)
+            (display base "static:\n")
             (%display-section "members:" s-mem  (%str-append base "  "))
             (%display-section "methods:" s-meth (%str-append base "  "))))
         (%display-section "members:" i-mem  base)
@@ -3143,9 +3301,8 @@
                 (%str-append (symbol->str %cls-arg)
                   (%str-append "/" %meth-str))))))
           (if (null? %me)
-            (do (display %c-error) (display "No documentation for ")
-                (display %cls-arg) (display " ") (display (first (rest args)))
-                (display %c-reset) (newline))
+            (do (display %c-error "No documentation for " %cls-arg " "
+                         (first (rest args)) %c-reset "\n"))
             (%display-doc %me)))
       (let ()
         (def %h-name (first args))
@@ -3164,8 +3321,7 @@
                   (let ()
                     (def %cdoc (%doc-lookup (class-name %cls)))
                     (if (null? %cdoc)
-                      (do (display %c-name) (display (class-name %cls))
-                          (display %c-reset) (newline))
+                      (do (display %c-name (class-name %cls) %c-reset "\n"))
                       (%display-doc %cdoc))
                     (%display-class-sections %cls "  "))
                   (let ()
@@ -3178,10 +3334,10 @@
                         ; those rather than a bare "no documentation".
                         (def %hits (%apropos-matches (symbol->str %h-name)))
                         (if (null? %hits)
-                          (do (display %c-error) (display "No documentation for ")
-                              (display %h-name) (display %c-reset) (newline))
-                          (do (display "No top-level doc for ") (display %h-name)
-                              (display "; documented methods matching it:") (newline)
+                          (do (display %c-error "No documentation for "
+                                       %h-name %c-reset "\n"))
+                          (do (display "No top-level doc for " %h-name
+                                       "; documented methods matching it:\n")
                               (%apropos-show %hits))))))))))))))))
 
 ; Doc-registry entries whose name CONTAINS pat (a string), sorted by name.
@@ -3236,7 +3392,7 @@
 (def modules
   (fn (_ )
     (%doc-commit!)
-    (display %c-bold) (display "Modules:") (display %c-reset) (newline)
+    (display %c-bold "Modules:" %c-reset "\n")
     (def %show
       (fn (self names)
         (if (not (null? names))
@@ -3251,7 +3407,7 @@
                     (def %md (%doc-lookup %name))
                     (if (not (null? %md))
                       (if (not (str=? (%doc-entry-desc %md) ""))
-                        (do (display " -- ") (display (%doc-entry-desc %md))))))
+                        (do (display " -- " (%doc-entry-desc %md))))))
                   (display "  [available]"))
                 (newline)))
             (self (rest names))))))
@@ -3989,6 +4145,46 @@
   (returns LIST "Filtered list")
   "Boot-layer filter; the public face is (List filter).")
 
+(note "Search")
+
+; The eq?/str=? split below is inherent, not stylistic: symbols intern
+; PER-BASE, so two spellings of one name from different bases never eq?,
+; while strings always compare by content.  The names encode the side so
+; every call site picks one deliberately (#227).
+
+(doc (def %memq?
+  (fn (self (param x ANY "Value to look for (eq? comparison)")
+       (param lst LIST "List to search"))
+    (match
+      ((null? lst) #f)
+      ((eq? x (first lst)) #t)
+      (#t (self x (rest lst))))))
+  (returns BOOL "True if x occurs in lst under eq?")
+  (note "Boot-layer eq? membership; the public face is (List includes?). Cross-base names need %member-str?.")
+  "Boot-layer eq? membership test.")
+
+(doc (def %member-str?
+  (fn (self (param s STR "String to look for (str=? comparison)")
+       (param lst LIST "List of strings"))
+    (match
+      ((null? lst) #f)
+      ((str=? s (first lst)) #t)
+      (#t (self s (rest lst))))))
+  (returns BOOL "True if s occurs in lst under str=?")
+  (note "The str=? side of the membership split; convert cross-base symbols to strings and use this.")
+  "Boot-layer string membership test.")
+
+(doc (def %find
+  (fn (self (param pred CALLABLE "Predicate")
+       (param lst LIST "List to search"))
+    (match
+      ((null? lst) ())
+      ((pred (first lst)) (first lst))
+      (#t (self pred (rest lst))))))
+  (returns ANY "First element satisfying pred, or nil")
+  (note "Boot-layer find-first; the public face is (List find). A nil result conflates a stored nil with a miss -- box at the call site when that matters (the %opt-cell pattern).")
+  "Boot-layer find-first matching element.")
+
 (def %for-each1
   (fn (self f lst)
     (if (null? lst) ()
@@ -4198,7 +4394,7 @@
 ; here per the standing rule: the C core is the unchecked processor.
 ;
 ; The gate is %int-number?, the SAVED C number?, deliberately: it is #f for
-; every boxed tower instance, so float/rational/bignum divisors fall through
+; every boxed tower instance, so float/rational/bigint divisors fall through
 ; to the tower's own type-op dispatch untouched ((/ 1.0 0.0) stays IEEE inf,
 ; rational zero keeps its own error).  Only a C-level integer zero -- the
 ; one value that reaches raw C division -- is stopped.  eq? alone would NOT
@@ -4273,7 +4469,7 @@
 ; CLOSURE -- (%arith-guard 2 "&" &) is handed the current value of & before
 ; set! rebinds it -- so no %int& / %int^ / %int<< family lands in the global
 ; namespace. (The %int+ .. %int= saves above predate this and stay: the tower
-; and bignum fetch them by name.)
+; and bigint fetch them by name.)
 ;
 ; The arity test runs ONCE, at wrap time, picking the unary or binary closure;
 ; the returned wrapper only does the checks the operator actually needs.
@@ -4359,61 +4555,44 @@
 ; Requires: data.x (first-int, set-first-int!)
 
 ; Write to stderr (swap fileout fd, display, restore)
+; Variadic like display (#291): the fd swap wraps the whole batch.  A
+; loop, not (apply display msgs): display is an OP, and applying it to
+; VALUES would re-evaluate a list value as a form.
 (def %stderr
-  (fn (_ msg)
-    (def %files (rest (first (first (rest (first (%base)))))))
+  (fn (_ . msgs)
+    (def %files (%reflect-base-cell (lit files)))
     (def %fo (first (rest %files)))
-    (def %s (%first-int %fo))
-    (%set-first-int! %fo (%first-int (first (rest (rest %files)))))
-    (display msg)
-    (%set-first-int! %fo %s)))
+    (def %s (%cell-int %fo))
+    (%set-cell-int! %fo (%cell-int (first (rest (rest %files)))))
+    (def %each
+      (fn (self lst)
+        (if (eq? lst ()) ()
+          (do (display (first lst)) (self (rest lst))))))
+    (%each msgs)
+    (%set-cell-int! %fo %s)))
 
 ; Quick profile dump to stderr (alloc-count + heap object count).
 ; ns `heap` is de-registered (R5): fetch the prim from the catalog.
-(def %heap-count (prim-ref (lit heap) (lit count)))
-; Fetch the io plumbing prims from the catalog (ns `io` partly de-registered, R5).
-(def %read-char (prim-ref (lit io) (lit read-char)))
 
-(def %profile-dump
-  (fn (_ )
-    (%stderr
-      (%first-int
-        (first (first (first (first (rest (rest (first (%base))))))))))
-    (%stderr " ")
-    (%stderr (%heap-count))
-    (%stderr "\n")
-    ()))
 
 ; Buffer length and unread for tokenizer scoring
 (def %buffer-len
   (fn (_ buffer)
-    (- (%first-int (rest buffer)) (%first-int buffer))))
+    (- (%cell-int (rest buffer)) (%cell-int buffer))))
 (def %buffer-unread
   (fn (_ buffer)
-    (%set-first-int!
+    (%set-cell-int!
       (rest buffer)
-      (- (%first-int (rest buffer)) 1))))
+      (- (%cell-int (rest buffer)) 1))))
 (def %score-set
   (fn (_ score sign buffer)
-    (%set-first-int! score (* sign (%buffer-len buffer)))))
+    (%set-cell-int! score (* sign (%buffer-len buffer)))))
 
-; Peek at next character without consuming it
-(def %peek-char
-  (fn (_ )
-    (def %ch (%read-char))
-    (if (null? %ch)
-      ()
-      (do
-        (%buffer-unread
-          (first
-            (first (rest (rest (rest (rest (first (%base)))))))))
-        %ch))))
 
 ; Current source line number
 (def %current-line
   (fn (_ )
-    (%first-int
-      (first (first (rest (first (rest (first (%base))))))))))
+    (%cell-int (first (%reflect-base-cell (lit line))))))
 
 (doc (provide x/reader/intrinsics)
   "Low-level tokenizer and profiling intrinsics: buffer scoring helpers and line tracking.")
@@ -4457,6 +4636,34 @@
   (returns BOOL "True if key is present")
   (note "Bootstrap layer: the object system dispatches through this. Class API: (Assoc has? ...).")
   "Test whether a key exists in an alist.")
+
+; Entry-returning lookups (#227): %assoc-get conflates a stored nil with
+; a miss; these return the (key . value) ENTRY, so callers test presence
+; with null? and read the value with rest.  Two key-equality sides, like
+; the membership helpers in list.x: symbols intern per-base (eq? never
+; matches across bases), strings always compare by content.
+
+(doc (def %assq
+  (fn (self (param key SYMBOL "Key to look up (eq? comparison)")
+       (param alist LIST "Association list"))
+    (match
+      ((null? alist) ())
+      ((eq? key (first (first alist))) (first alist))
+      (#t (self key (rest alist))))))
+  (returns ANY "The (key . value) entry pair, or nil if not found")
+  (note "Entry-returning eq? lookup. Class API: (Assoc entry ...).")
+  "Look up a key in an alist, returning the entry pair or nil.")
+
+(doc (def %assoc-str
+  (fn (self (param key STR "String key (str=? comparison)")
+       (param alist LIST "Alist with string keys"))
+    (match
+      ((null? alist) ())
+      ((str=? key (first (first alist))) (first alist))
+      (#t (self key (rest alist))))))
+  (returns ANY "The (key . value) entry pair, or nil if not found")
+  (note "The str=? side of the key-equality split: tables keyed by converted (cross-base) names use this.")
+  "Look up a string key in an alist, returning the entry pair or nil.")
 
 (note "Modification")
 
@@ -4582,9 +4789,105 @@
   (example "(Assoc get 'x '((x . 1) (y . 2)))" "1")
   "Association-list bootstrap: get/has?/del/put/keys and let-opts.")
 ; ---- end lib/x/core/alist.x ----
-; import (not include): registers the NAME so str-utf8.x's and the StrUTF8
+; import (not include): registers the NAME so str-utf8.x's and the StrUtf8
 ; protocol class's (import x/codec/utf8) become no-ops instead of reloading it.
-(import x/codec/utf8)
+(%module-loaded! (lit x/codec/utf8))
+; ---- begin lib/x/codec/utf8.x ----
+; codec/utf8.x -- UTF-8 byte <-> code-point codec (protocol-agnostic primitives)
+;
+; The single shared UTF-8 transform, used by both the boot string layer
+; (str->list in x/type/str-utf8) and the protocol layer (the Utf8 class in
+; x/protocol/str/utf8). Pure functions over the byte-level string primitives
+; (%str-ref / str-length operate on bytes) plus bitwise ops -- no object system,
+; so it loads at boot, below everything that consumes it.
+;
+; Uses nested `if`, never `cond`: these functions are intended to also run
+; inside tokenizer analyse/read callbacks (for #\<utf8> literals), where a
+; library macro that allocates can trigger GC mid-parse and corrupt the C stack
+; (see the tokenizer-callback constraints in project memory).
+
+; Number of bytes in the UTF-8 sequence introduced by lead byte b (0-255).
+; Fetch the char/int casts from the catalog (ns `char`/`int` utility members de-registered, R5).
+(def %char->integer (prim-ref (lit char) (lit ->int)))
+
+(def %utf8-seq-len
+  (fn (_ b)
+    (if (< b 192) 1        ; 0xxxxxxx  ASCII (or a stray continuation byte)
+    (if (< b 224) 2        ; 110xxxxx
+    (if (< b 240) 3        ; 1110xxxx
+      4)))))               ; 11110xxx
+
+; Decode the UTF-8 sequence at byte index i of s -> (code-point . next-index).
+; The shifted lead/continuation parts occupy disjoint bit ranges, so | merges
+; them losslessly.
+(def %utf8-decode
+  (fn (_ s i)
+    (def b0 (%char->integer (%str-ref s i)))
+    (def n (%utf8-seq-len b0))
+    (def cont (fn (_ k) (& (%char->integer (%str-ref s (+ i k))) 63)))   ; low 6 bits
+    (pair
+      (if (= n 1) b0
+      (if (= n 2) (| (<< (& b0 31) 6) (cont 1))
+      (if (= n 3) (| (| (<< (& b0 15) 12) (<< (cont 1) 6)) (cont 2))
+        (| (| (| (<< (& b0 7) 18) (<< (cont 1) 12)) (<< (cont 2) 6)) (cont 3)))))
+      (+ i n))))
+
+; --- Allocation-light accessors (no pair, no inner closure) ---
+;
+; utf8-decode conses a (cp . next) pair and builds a `cont` closure per call.
+; That allocation is unsafe inside tokenizer reader callbacks (it can trigger GC
+; mid-parse -- see project memory). These two split the same computation so a
+; caller takes only the part it needs with NOTHING heap-allocated in the body:
+; just str-ref reads and bitwise ops. Continuation reads are inlined (no helper).
+
+; Byte width of the sequence at byte index i (1-4). No allocation.
+(def %utf8-width (fn (_ s i) (%utf8-seq-len (%char->integer (%str-ref s i)))))
+
+; Code point at byte index i. No allocation (continuation bytes inlined).
+(def %utf8-cp-at
+  (fn (_ s i)
+    (def b0 (%char->integer (%str-ref s i)))
+    (if (< b0 128) b0
+    (if (< b0 224)
+      (| (<< (& b0 31) 6)
+         (& (%char->integer (%str-ref s (+ i 1))) 63))
+    (if (< b0 240)
+      (| (| (<< (& b0 15) 12)
+            (<< (& (%char->integer (%str-ref s (+ i 1))) 63) 6))
+         (& (%char->integer (%str-ref s (+ i 2))) 63))
+      (| (| (| (<< (& b0 7) 18)
+               (<< (& (%char->integer (%str-ref s (+ i 1))) 63) 12))
+            (<< (& (%char->integer (%str-ref s (+ i 2))) 63) 6))
+         (& (%char->integer (%str-ref s (+ i 3))) 63)))))))
+
+; Encode code point cp as a list of its 1-4 UTF-8 byte values (0-255). Out-of-
+; range code points emit U+FFFD (the replacement character), matching the C
+; encoder this replaces. Returns bare integers, not CHARACTERs: callers map
+; integer->char to byte-pack via bytes->str, or use the bytes directly.
+(def %utf8-encode
+  (fn (self cp)
+    (if (if (< cp 0) #t (> cp 1114111))   ; out of range -> U+FFFD
+      (self 65533)
+    (if (< cp 128)
+      (list cp)                            ; 0xxxxxxx
+    (if (< cp 2048)
+      (list (| 192 (>> cp 6))              ; 110xxxxx
+            (| 128 (& cp 63)))
+    (if (< cp 65536)
+      (list (| 224 (>> cp 12))             ; 1110xxxx
+            (| 128 (& (>> cp 6) 63))
+            (| 128 (& cp 63)))
+      (list (| 240 (>> cp 18))             ; 11110xxx
+            (| 128 (& (>> cp 12) 63))
+            (| 128 (& (>> cp 6) 63))
+            (| 128 (& cp 63)))))))))
+
+(doc (provide x/codec/utf8)
+  (note "Internals are %-private (they also run inside tokenizer callbacks, where")
+  (note "class dispatch is forbidden). The public API is on the Utf8 class:")
+  (note "(Utf8 decode s i), (Utf8 encode cp), (Utf8 width s i), ...")
+  "UTF-8 codec: byte <-> code-point primitives (module-private; surfaced on Utf8).")
+; ---- end lib/x/codec/utf8.x ----
 ; Low-level UTF-8 code-point layer for the STRING type: the list<->str
 ; transforms (needed by char-io / number->str / convert) plus the bare (s i)
 ; -> code-point handler. Safe here -- str-ref/str-length/substring stay pinned
@@ -4607,7 +4910,7 @@
 ; bytes directly and ignore this handler. So readers/tokenizers/loaders that
 ; need bytes use those (or the Str8 class) and never touch the ambient (s i).
 ;
-; The high-level string library -- the Str8 / StrUTF8 protocol classes and the
+; The high-level string library -- the Str8 / StrUtf8 protocol classes and the
 ; Str entry point -- lives in x/type/str, loaded later once objects exist.
 ;
 ; No UTF-8 in C: C packs/loads bytes; this x-lang layer owns the byte<->code-
@@ -4630,7 +4933,7 @@
 (def %type-push-call (prim-ref (lit type) (lit push-call)))
 
 (import x/core/list)
-(import x/codec/utf8)
+; (import x/codec/utf8) -- inlined above
 
 ; --- list <-> string (code-point) transforms -------------------------------
 
@@ -4641,10 +4944,17 @@
 ; (list->str (str->list s)) round-trips any UTF-8 string.
 (doc (def %list->str
   (fn (_ chars)
-    (bytes->str
-      (%map %integer->char
-        (%fold (fn (_ acc ch) (%append acc (%utf8-encode (%char->integer ch))))
-              () chars)))))
+    ; Reverse-prepend each code point's bytes, reverse once (#333): the
+    ; per-char %append was O(n^2) pairs -- this is the registered
+    ; STRING <- list converter, so every list->string conversion paid it.
+    (do
+      (def %rev-onto (fn (self l acc)
+        (match ((null? l) acc) (#t (self (rest l) (pair (first l) acc))))))
+      (bytes->str
+        (%map %integer->char
+          (%reverse
+            (%fold (fn (_ acc ch) (%rev-onto (%utf8-encode (%char->integer ch)) acc))
+                  () chars)))))))
   (param chars LIST "List of CHARACTERs (Unicode code points)")
   (returns STRING "UTF-8 string encoding each code point")
   "Build a UTF-8 string from a list of code-point characters. Inverse of str->list.")
@@ -4694,7 +5004,7 @@
 ; %utf8-cp-at is an unchecked read, so this is the x-lang guard. INT-ONLY by
 ; design (the N5 coercion exception): this handler can run under reader
 ; constraints, where conversion dispatch is illegal -- the protocol classes
-; (Str8/StrUTF8 ref) are the coercing doors.
+; (Str8/StrUtf8 ref) are the coercing doors.
 (def %cp-ref
   (fn (_ s i)
     (def len (%str-byte-len s))
@@ -4704,7 +5014,7 @@
       (%integer->char (%utf8-cp-at s b))
       (Err raise (lit index) "str: index out of range" ()))))
 
-; Clamped like StrUTF8 sub: offsets past the end yield the empty/short slice.
+; Clamped like StrUtf8 sub: offsets past the end yield the empty/short slice.
 ; A negative count must short-circuit -- the offset walk only stops on k = 0,
 ; so a negative k would otherwise clamp at the end and take the whole tail.
 (def %cp-substring
@@ -4725,7 +5035,7 @@
         (%cp-substring s (first vals) (first (rest vals)))))))
 
 (doc (provide x/type/str-utf8)
-  (note "Low-level layer, loaded before the object system. The high-level string API is the Str8 / StrUTF8 classes and the Str entry point in x/type/str.")
+  (note "Low-level layer, loaded before the object system. The high-level string API is the Str8 / StrUtf8 classes and the Str entry point in x/type/str.")
   (note "The %-private byte API (%str-length, %str-ref, %substring) stays byte-level; only the bare (s i) call is code-point aware.")
   "The low-level UTF-8 code-point layer for the STRING type: the list<->str transforms and the bare (s i) code-point indexing handler.")
 ; ---- end lib/x/type/str-utf8.x ----
@@ -4744,7 +5054,7 @@
 ; Loaded right after the codec and string layer at boot, before any
 ; character is printed.
 
-(import x/codec/utf8)
+; (import x/codec/utf8) -- inlined above
 ; Fetch the type-system helpers from the catalog (registered by sys/type.x).
 (def %type-by-atom (prim-ref (lit type) (lit by-atom)))
 (def %type-push-write (prim-ref (lit type) (lit push-write)))
@@ -4847,6 +5157,21 @@
 (def %obj-fields (fn (_ inst) (first (%obj-box inst))))
 (def %class-data (fn (_ c) (first c)))                 ; a class object's alist
 
+; In-place write into a boxed alist: mutate the existing entry when the key
+; is present (the common case -- every declared member exists from
+; construction), else prepend a fresh entry. Replaces the %assoc-put path,
+; which copied the whole alist per write and reordered the written key to
+; the head: the update path now allocates nothing and field order stays
+; construction order. An in-flight iteration over the alist sees the update
+; (live view, not a snapshot).
+(def %box-put!
+  (fn (_ box key v)
+    (let ((entry (%assq key (first box))))
+      (if (null? entry)
+        (%set-first! box (pair (pair key v) (first box)))
+        (%set-rest! entry v))
+      v)))
+
 ; Raw field accessors injected into every instance-method body (closing over
 ; `self`), so a method can bypass a same-named override to reach a field's
 ; storage -- the "private data" pattern. Method-local only.
@@ -4854,9 +5179,280 @@
 (def %method-raw-bindings
   (lit
     ((member     (fn (_ n) (%assoc-get n (%obj-fields self))))
-     (set-member! (fn (_ n v)
-                   (%set-first! (%obj-box self) (%assoc-put n v (%obj-fields self)))
-                   v)))))
+     (set-member! (fn (_ n v) (%box-put! (%obj-box self) n v))))))
+
+(note "Flat dispatch tables (the hot path)")
+
+; Unique sentinel marking a FIELD entry in a flat table (a method entry is
+; the method closure itself). A fresh pair, compared by eq? -- unforgeable.
+(def %field-tag (list (lit %field)))
+
+; Privacy wrapper sentinel: a table entry (%priv-tag vis defining . inner)
+; guards inner behind the dispatch-door check below. Same unforgeable-pair
+; trick as %field-tag.
+(def %priv-tag (list (lit %priv)))
+
+; The ambient caller-class probe. Every method body lexically rebinds
+; %this-class to a one-cell box holding its DEFINING class (filled by
+; def-class once the class object exists); evaluated from a non-method
+; context it resolves to this nil. super derives its parent from the same
+; box, replacing the old direct %super-class binding at zero added
+; per-call bindings.
+(def %this-class ())
+
+; Find `sel` in a flat table and self-organize: a hit DEEPER THAN POSITION
+; TWO swaps its (sel . entry) pair with the head's via two %set-first!, so a
+; hot selector is a front hit from its second call on. The top-2 exemption
+; matters: a method that reads a field alternates two hot selectors, and
+; unconditional move-to-front made them ping-pong the head slot -- two swap
+; writes per call, measured slower than no table at all. With the exemption
+; an alternating pair settles into the top two and never swaps again.
+; Returns the entry (a method closure or %field-tag) or nil. `head` is the
+; table's first spine cell; callers pass the table twice.
+(def %tab-find!
+  (fn (loop cell head sel)
+    (unless (null? cell)
+      (let ((p (first cell)))
+        (if (eq? (first p) sel)
+          (do
+            (unless (if (eq? cell head) #t (eq? cell (rest head)))
+              (%set-first! cell (first head))
+              (%set-first! head p))
+            (rest p))
+          (loop (rest cell) head sel))))))
+
+; Build a class's hot record: flat, chain-merged dispatch tables plus the
+; construction caches, shape
+;   (itab stab fields ctor-names)
+; itab holds instance methods + instance-field markers; stab holds static
+; methods + static-member markers, both chain-merged. An OWN static member
+; marks as the bare %field-tag; an INHERITED one as (%field-tag . OWNER),
+; the nearest ancestor whose box holds it -- reads go to the owner's box,
+; matching what (help) has always displayed. A static member named `new`
+; is dropped at every level: it never shadowed the new builtin. fields is
+; the %all-fields (name . default-thunk) alist and ctor-names the
+; positional constructor order. Most-derived wins: the chain walk records a
+; name on first sight only, and a method beats a same-named field marker
+; exactly as dispatch always had it. Every spine pair and (sel . entry)
+; pair is freshly consed -- %tab-find! reorders the table in place, so it
+; must share no structure with the cold class alists (slot 0), which stay
+; the single authoritative source help and introspection read.
+(def %flatten-class
+  (fn (_ class)
+    ; local + cold on purpose: activation-scoped mid-body defs (only TAIL
+    ; defs leak globally under TCO), the %build-class pattern.
+    (def %seen?
+      (fn (loop n tab)
+        (if (null? tab) #f
+          (if (eq? n (first (first tab))) #t (loop n (rest tab))))))
+    (def %fold-rows                       ; add (k . (mk row)) on first sight
+      (fn (loop al mk acc)
+        (if (null? al) acc
+          (loop (rest al) mk
+            (if (%seen? (first (first al)) acc)
+              acc
+              (pair (pair (first (first al)) (mk (first al))) acc))))))
+    (def %not-new? (fn (_ row) (not (eq? (first row) (lit new)))))
+    ; Visibility wrap: a name listed in the defining level's vis alist
+    ; ((name . private|protected) ...) gets its entry guarded as
+    ; (%priv-tag vis defining . inner); anything else passes bare.
+    (def %vis-wrap
+      (fn (_ c visal name inner)
+        (let ((v (%assoc-get name visal)))
+          (if (null? v) inner
+            (pair %priv-tag (pair v (pair c inner)))))))
+    (def %ivis-of (fn (_ c) (%assoc-get (lit ivis) (%class-data c))))
+    (def %svis-of (fn (_ c) (%assoc-get (lit svis) (%class-data c))))
+    (def %walk-methods                    ; `key` method alists, derived first
+      (fn (loop c key visf acc)
+        (if (null? c) acc
+          (loop (%assoc-get (lit parent) (%class-data c)) key visf
+            (let ((visal (visf c)))
+              (%fold-rows (%assoc-get key (%class-data c))
+                (fn (_ row) (%vis-wrap c visal (first row) (rest row)))
+                acc))))))
+    (def %walk-ifields                    ; instance-field markers, derived first
+      (fn (loop c acc)
+        (if (null? c) acc
+          (loop (%assoc-get (lit parent) (%class-data c))
+            (let ((visal (%ivis-of c)))
+              (%fold-rows (%assoc-get (lit fields) (%class-data c))
+                (fn (_ row) (%vis-wrap c visal (first row) %field-tag))
+                acc))))))
+    (def %walk-statics                    ; ancestor static members, nearest first
+      (fn (loop c acc)
+        (if (null? c) acc
+          (loop (%assoc-get (lit parent) (%class-data c))
+            (let ((visal (%svis-of c)))
+              (%fold-rows (%filter %not-new? (%class-statics c))
+                (fn (_ row) (%vis-wrap c visal (first row) (pair %field-tag c)))
+                acc))))))
+    (let ((fields (%all-fields class)))
+      (list (%walk-ifields class (%walk-methods class (lit methods) %ivis-of ()))
+            (%walk-statics (%assoc-get (lit parent) (%class-data class))
+              (let ((visal (%svis-of class)))
+                (%fold-rows (%filter %not-new? (%class-statics class))
+                  (fn (_ row) (%vis-wrap class visal (first row) %field-tag))
+                  (%walk-methods class (lit s-methods) %svis-of ()))))
+            fields
+            (%ctor-member-names class)))))
+
+; Every class ever built, for table invalidation: a shadow-write (or, later
+; in this arc, runtime method addition) clears every class's slot 1 with
+; %classes-invalidate!, and each rebuilds on its next dispatch. Classes
+; carry no child links, so "which descendants are stale" is unanswerable
+; locally -- and mutation is cold, so clearing everything is the cheap side
+; of the trade (the hot path keeps ZERO staleness checks). The registry
+; pins redefined class objects; redefinition is a REPL affair and the cold
+; alists are small.
+(def %class-registry (list ()))
+(def %classes-invalidate!
+  (fn (_)
+    (def %go
+      (fn (loop cs)
+        (unless (null? cs)
+          (do (%set-rest! (first cs) ())
+              (loop (rest cs))))))
+    (%go (first %class-registry))))
+
+; Add a method row to a class's cold alist (key = methods | s-methods) and
+; invalidate every hot table. Prepend, so the newest registration wins over
+; both an earlier addition and the def-class-time definition (the flattener
+; records first sight per level). Returns nil: a mutation, not a value.
+(def %class-add!
+  (fn (_ class key sel f)
+    (unless (symbol? sel)
+      (error "def-method!: selector must be a symbol"))
+    (let ((row (%assq key (%class-data class))))
+      (%set-rest! row (pair (pair sel f) (rest row))))
+    (%classes-invalidate!)
+    ()))
+
+; Unwrap a privacy wrapper to its inner entry, NO access check -- for the
+; runtime's own protocol-hook lookups (%init, %missing), which fire on the
+; instance's behalf whatever the hook's declared visibility.
+(def %entry-inner
+  (fn (_ entry)
+    (if (if (pair? entry) (eq? (first entry) %priv-tag) #f)
+      (rest (rest (rest entry)))
+      entry)))
+
+; The dispatch-door privacy check. The caller's class comes from the
+; lexical %this-class box every method body binds; from a non-method
+; context the ambient nil makes the answer "outside". private = the same
+; class only; protected = chain-related in EITHER direction, so a parent
+; method calling down into a subclass-protected override stays legal, as
+; does the ordinary inherited-helper call up.
+(def %vis-allowed?
+  (fn (_ vis defining e)
+    (let ((b (eval (lit %this-class) e)))
+      (let ((caller (if (null? b) () (first b))))
+        (match
+          ((null? caller) #f)
+          ((eq? vis (lit private)) (same? caller defining))
+          ((%class-ancestor? caller defining) #t)
+          (#t (%class-ancestor? defining caller)))))))
+
+; A pair entry reaching a dispatch method branch is a privacy wrapper
+; (%priv-tag vis defining . inner): check access, then process inner
+; exactly as the plain branches would. Guarded members are the cold side
+; by construction, so the method path uses plain apply -- no trampoline
+; subtleties inside a helper fn.
+(def %priv-entry
+  (fn (_ target class entry selector args e static?)
+    (let ((vis (first (rest entry)))
+          (defining (first (rest (rest entry))))
+          (inner (rest (rest (rest entry)))))
+      (unless (%vis-allowed? vis defining e)
+        (error (%str-append (symbol->str (class-name class))
+          (%str-append ": " (%str-append (symbol->str selector)
+            (%str-append (if (eq? vis (lit private)) " is private to " " is protected to ")
+              (symbol->str (class-name defining))))))))
+      (match
+        ((eq? inner %field-tag)
+          (if static?
+            (match
+              ((null? args) (%assoc-get selector (%class-statics class)))
+              (#t (%box-put! (%class-statics-box class) selector (eval (first args) e))))
+            (match
+              ((null? args) (%assoc-get selector (%obj-fields target)))
+              (#t (%box-put! (%obj-box target) selector (eval (first args) e))))))
+        ((if (pair? inner) (eq? (first inner) %field-tag) #f)   ; inherited static
+          (match
+            ((null? args) (%assoc-get selector (%class-statics (rest inner))))
+            (#t
+              (let ((v (eval (first args) e)))
+                (%box-put! (%class-statics-box class) selector v)
+                (%classes-invalidate!)
+                v))))
+        (#t (apply inner (pair target (%map1 (fn (_ a) (eval a e)) args))))))))
+
+; Entry discrimination for the cold resolvers (method-of, method-ref, the
+; value-call handlers): a callable PUBLIC method entry, or nil for a miss,
+; a field marker, an inherited-static marker, or a privacy-guarded entry --
+; the resolvers are reachable from anywhere, so they never hand out a
+; guarded method.
+(def %entry-method
+  (fn (_ entry)
+    (match
+      ((null? entry) ())
+      ((eq? entry %field-tag) ())
+      ((if (pair? entry) #t #f) ())
+      (#t entry))))
+
+; Forwarder engine for the `delegates` def-class form: resolve `sel` on
+; the delegate value's own tables per call (late-bound, like method-ref)
+; and apply directly on the already-evaluated args. Methods only: a
+; delegate's FIELD is reached by writing the one-line method by hand.
+(def %delegate-call
+  (fn (_ target sel args)
+    (let ((entry
+            (if (object? target)
+              (let ((itab (first (%class-hot (%obj-class target)))))
+                (%entry-method (%tab-find! itab itab sel)))
+              (if (class? target)
+                (let ((stab (first (rest (%class-hot target)))))
+                  (%entry-method (%tab-find! stab stab sel)))
+                ()))))
+      (if (null? entry)
+        (error (%str-append "delegates: no such method " (symbol->str sel)))
+        (apply entry (pair target args))))))
+
+; A class's hot record, built on first dispatch. Lives in the class
+; object's SLOT 1 -- the free traced slot make-instance leaves nil -- while
+; slot 0 keeps the cold authoritative alist. No staleness probe on the hot
+; path: classes are immutable after def-class today, and a redefinition
+; mints a fresh class object (fresh empty slot 1). The open-classes phase
+; adds mutators; they must clear slot 1 (via a class registry) rather than
+; tax every dispatch with a generation compare.
+(def %class-hot
+  (fn (_ class)
+    (let ((hot (rest class)))
+      (if (null? hot)
+        (let ((fresh (%flatten-class class)))
+          (%set-rest! class fresh)
+          fresh)
+        hot))))
+
+; Total dispatch miss, one seam. The %missing protocol hook fires first
+; when the chain defines it: (method %missing (self sel args) ...) --
+; instance side resolves it through the flat itab, static side through the
+; stab, so it inherits like any method. `target` is the receiver (instance
+; or class), `args` the RAW argument forms, evaluated here (cold path)
+; before the hook sees them as a list. Without a hook, a named error.
+; The generic-dispatch trapdoor interposes here in a later phase.
+(def %dispatch-miss
+  (fn (_ target class selector args e static?)
+    (let ((tab (if static?
+                 (first (rest (%class-hot class)))
+                 (first (%class-hot class)))))
+      (let ((m (%entry-method (%entry-inner (%tab-find! tab tab (lit %missing))))))
+        (if (null? m)
+          (error (%str-append (symbol->str (class-name class))
+            (%str-append (if static? ": no such static member " ": no such member ")
+              (symbol->str selector))))
+          (apply m (list target selector
+                     (%map1 (fn (_ a) (eval a e)) args))))))))
 
 (note "Member lookup (walks the single-inheritance parent chain)")
 
@@ -4909,7 +5505,7 @@
 (def %names-minus
   (fn (loop names seen)
     (unless (null? names)
-      (if (%name-in? (first names) seen)
+      (if (%memq? (first names) seen)
         (loop (rest names) seen)
         (pair (first names) (loop (rest names) seen))))))
 
@@ -4964,62 +5560,144 @@
 ; #f = data used as-is (new-from; keyword store only).
 (def %instantiate
   (fn (_ class inits e eval?)
-    (let ((fields (%all-fields class)))
-      (let ((store (if eval?
-                     (%positional->store inits (%ctor-member-names class) fields class)
-                     inits)))
-        (%check-init-keys store fields class)
-        (let ((inst (%make-instance %object
-                      (list class (%init-fields fields store e eval?)))))
-          ; %init protocol hook (the initialize slot): a class's %init method,
-          ; if any, runs once the fields are built -- construction logic beyond
-          ; plain field values. Resolved through %lookup, so a child's override
-          ; wins and (super self %init) chains as usual. Fires on every
-          ; construction door (new, class-dispatch new, new-from).
-          (let ((m (%lookup class (lit methods) (lit %init))))
-            (unless (null? m) (apply m (list inst))))
-          inst)))))
+    ; fields (the %all-fields template) and the positional ctor order both
+    ; come from the class's hot record -- computed once per table build, not
+    ; re-walked per construction.
+    (let ((hot (%class-hot class)))
+      (let ((fields (first (rest (rest hot)))))
+        (let ((store (if eval?
+                       (%positional->store inits (first (rest (rest (rest hot)))) fields class)
+                       inits)))
+          (%check-init-keys store fields class)
+          (let ((inst (%make-instance %object
+                        (list class (%init-fields fields store e eval?)))))
+            ; %init protocol hook (the initialize slot): a class's %init
+            ; method, if any, runs once the fields are built -- construction
+            ; logic beyond plain field values. Resolved through the flat
+            ; table, so a child's override wins and (super self %init)
+            ; chains as usual. Fires on every construction door (new,
+            ; class-dispatch new, new-from).
+            (let ((itab (first hot)))
+              (let ((m (%entry-inner (%tab-find! itab itab (lit %init)))))
+                (unless (if (null? m) #t (eq? m %field-tag))
+                  (apply m (list inst)))))
+            inst))))))
 
 (note "Dispatch handlers")
 
-; Instance dispatch: a method (from the instance's class) wins; otherwise the
-; member is an instance field that (obj f) reads and (obj f v) writes.
+; Instance dispatch: resolve the selector in the class's flat table -- ONE
+; walk decides method vs field vs miss (a field read no longer pays a full
+; method-chain miss first). A method entry is re-driven through tail-eval:
+; the closure self-evaluates as head, the instance self-evaluates in arg
+; position, and C evaluates the raw arg forms once in the caller's env --
+; no per-arg eval closure, no apply save/restore. (Stack semantics are the
+; trampoline's, unchanged: the old apply path already rode it -- measured,
+; both dispatches complete a 30k-deep method recursion.)
+; A table miss still consults the instance's own fields: set-member! can
+; add an undeclared key to ONE instance, which the class-wide table cannot
+; know about. NOTE: `rest` is the caller's raw form tail and is often a
+; C-BUILT STRUCTURAL SPINE (method bodies are), for which pair? answers #f
+; -- never pair?-test it; a dotted tail surfaces through %map1's improper-
+; list guard exactly as it always did.
 (def %object-dispatch
-  (op (self sel-raw . rest) e
-    (let ((selector (%selector sel-raw)))
-      (let ((method (%lookup (%obj-class self) (lit methods) selector)))
+  (op (self sel-raw . args) e
+    (let ((selector (%selector sel-raw))
+          (itab (first (%class-hot (%obj-class self)))))
+      (let ((entry (%tab-find! itab itab selector)))
         (match
-          ((not (null? method))
-            (apply method (pair self (%map1 (fn (_ a) (eval a e)) rest))))
-          ((%assoc-has? selector (%obj-fields self))
+          ((eq? entry %field-tag)
             (match
-              ((null? rest) (%assoc-get selector (%obj-fields self)))
-              (#t (let ((v (eval (first rest) e)))
-                    (%set-first! (%obj-box self) (%assoc-put selector v (%obj-fields self)))
-                    v))))
-          (#t (error "object: no such member")))))))
+              ((null? args) (%assoc-get selector (%obj-fields self)))
+              (#t (%box-put! (%obj-box self) selector (eval (first args) e)))))
+          ((not (null? entry))
+            (if (pair? entry)                          ; privacy wrapper
+              (%priv-entry self (%obj-class self) entry selector args e #f)
+              (tail-eval (pair entry (pair self args)) e)))
+          ((%assoc-has? selector (%obj-fields self))   ; ad-hoc instance key
+            (match
+              ((null? args) (%assoc-get selector (%obj-fields self)))
+              (#t (%box-put! (%obj-box self) selector (eval (first args) e)))))
+          (#t (%dispatch-miss self (%obj-class self) selector args e #f)))))))
+
+; The de-dispatch door (#332): resolve a method ONCE and call it inside
+; a hot loop with self as argument 0.  A stored method is a plain fn
+; closure and is APPLICATIVE at direct call -- args evaluate exactly
+; once (verified: procedure call evaluates the arg list before the
+; WRAP-flag branch).  Callers must NOT (wrap ...) the handle: that adds
+; a SECOND evaluation pass over the already-evaluated values -- wasted
+; work for self-evaluating values, a re-resolution bug for symbols.
+; Resolution goes through the flat table, so it is chain-aware (a
+; subclass override keeps winning); the traversals in protocol/seq.x
+; are the canonical
+; users -- (self done? ...) per ELEMENT paid a selector, a chain walk,
+; an arg-list allocation and an apply, per element, per traversal.
+(doc (def method-of
+  (fn (_ (param class CLASS "Class to resolve against")
+       (param sel SYMBOL "Static-method selector"))
+    (let ((stab (first (rest (%class-hot class)))))
+      (%entry-method (%tab-find! stab stab sel)))))
+  (returns CALLABLE "The resolved static method closure, or nil")
+  (note "The sanctioned de-dispatch door: resolve once, call directly in the hot")
+  (note "loop with the class as argument 0 -- ((method-of C 'step) C cur v).")
+  (note "Do NOT (wrap ...) the handle; a stored method already evaluates its")
+  (note "args exactly once at direct call.")
+  (see method-ref)
+  "Resolve a static method to a bare closure for hot-loop direct calls.")
+
+(def %class-method-of method-of)   ; historical internal name, same door
 
 (def %class-statics-box (fn (_ class) (%assoc-get (lit statics) (%class-data class))))
 (def %class-statics     (fn (_ class) (first (%class-statics-box class))))
 
-; Class dispatch: a static method wins; (Class new ...) builds an instance;
-; otherwise the member is a class-wide field that (Class f) reads, (Class f v) sets.
+; Class dispatch: one flat-table walk decides static method vs class-wide
+; member vs the new builtin -- the same tail-eval re-drive as instance
+; dispatch. A static METHOD named new is in the table and shadows the
+; builtin (as always); a static MEMBER named new was dropped at flatten,
+; so the builtin still wins there (as always).
 (def %class-dispatch
-  (op (self sel-raw . rest) e
-    (let ((selector (%selector sel-raw)))
-      (let ((method (%lookup self (lit s-methods) selector)))
+  (op (self sel-raw . args) e
+    (let ((selector (%selector sel-raw))
+          (stab (first (rest (%class-hot self)))))
+      (let ((entry (%tab-find! stab stab selector)))
         (match
-          ((not (null? method))
-            (apply method (pair self (%map1 (fn (_ a) (eval a e)) rest))))
-          ((eq? selector (lit new))                       ; (Class new k v ...): values are code
-            (%instantiate self rest e #t))
-          ((%assoc-has? selector (%class-statics self))
+          ((eq? entry %field-tag)                     ; own static member
             (match
-              ((null? rest) (%assoc-get selector (%class-statics self)))
-              (#t (let ((v (eval (first rest) e)))
-                    (%set-first! (%class-statics-box self) (%assoc-put selector v (%class-statics self)))
-                    v))))
-          (#t (error "object: no such static member")))))))
+              ((null? args) (%assoc-get selector (%class-statics self)))
+              (#t (%box-put! (%class-statics-box self) selector (eval (first args) e)))))
+          ((if (pair? entry) (eq? (first entry) %field-tag) #f)
+            ; inherited static member: reads go to the owning ancestor's box
+            ; (nearest wins, matching help's display); a write SHADOWS into
+            ; our own box -- the parent's value is never mutated through a
+            ; child; spell a deliberate parent write (Parent name v). The
+            ; shadow invalidates every hot table: descendants' markers may
+            ; point past this class.
+            (match
+              ((null? args) (%assoc-get selector (%class-statics (rest entry))))
+              (#t
+                (let ((v (eval (first args) e)))
+                  (%box-put! (%class-statics-box self) selector v)
+                  (%classes-invalidate!)
+                  v))))
+          ((not (null? entry))
+            (if (pair? entry)                              ; privacy wrapper
+              (%priv-entry self self entry selector args e #t)
+              (tail-eval (pair entry (pair self args)) e)))
+          ((eq? selector (lit new))                   ; (Class new k v ...): values are code
+            (%instantiate self args e #t))
+          ; Runtime method addition -- the open-class doors. Built-ins like
+          ; `new`: a static method of the same name shadows them (checked
+          ; above via the table). sel and fn are ordinary evaluated args, so
+          ; selectors can be computed (a runtime-defined command language
+          ; needs exactly that). The fn is stored AS-IS -- no super/member
+          ; injection; it receives (self . args) and uses (self f) access.
+          ; The cold alist is mutated (single source of truth: help and
+          ; introspection see the addition immediately) and every hot table
+          ; clears -- descendants must refold to see it.
+          ((eq? selector (lit def-method!))
+            (%class-add! self (lit methods) (eval (first args) e) (eval (first (rest args)) e)))
+          ((eq? selector (lit def-static!))
+            (%class-add! self (lit s-methods) (eval (first args) e) (eval (first (rest args)) e)))
+          (#t (%dispatch-miss self self selector args e #t)))))))
 
 ; --- Value-to-class call dispatch ---
 ; Build a TYPE call handler so an instance, called as (inst method . args),
@@ -5065,10 +5743,18 @@
           (pair obj (eval args e))
           (let ((sel (%selector (first args))))
             (if (symbol? sel)
-              (let ((m (%lookup class (lit s-methods) sel)))
-                (if (null? m)
-                  (error (%str-append "object: no such method " (symbol->str sel)))
-                  (apply m (pair class (%append (%map1 (fn (_ a) (eval a e)) (rest args)) (list obj))))))
+              ; Static-method resolve via the flat table; a static-member
+              ; marker is not callable here (same miss as before). The call
+              ; is re-driven through tail-eval: raw arg forms evaluate once
+              ; in the caller's env, and the receiver rides LAST, spliced as
+              ; (lit obj) so a list-valued subject is data, never a call.
+              (let ((stab (first (rest (%class-hot class)))))
+                (let ((m (%entry-method (%tab-find! stab stab sel))))
+                  (if (null? m)
+                    (error (%str-append "object: no such method " (symbol->str sel)))
+                    (tail-eval
+                      (pair m (pair class (%append (rest args) (list (list (lit lit) obj)))))
+                      e))))
               (pair obj (%data-echo (fn (_ a) (eval a e)) args)))))))))
 
 ; Variant for types that ALREADY have a call handler (indexing/matching): a
@@ -5090,10 +5776,18 @@
           (pair obj (eval args e))
           (let ((sel (%selector (first args))))
             (if (symbol? sel)
-              (let ((m (%lookup class (lit s-methods) sel)))
-                (if (null? m)
-                  (error (%str-append "object: no such method " (symbol->str sel)))
-                  (apply m (pair class (%append (%map1 (fn (_ a) (eval a e)) (rest args)) (list obj))))))
+              ; Static-method resolve via the flat table; a static-member
+              ; marker is not callable here (same miss as before). The call
+              ; is re-driven through tail-eval: raw arg forms evaluate once
+              ; in the caller's env, and the receiver rides LAST, spliced as
+              ; (lit obj) so a list-valued subject is data, never a call.
+              (let ((stab (first (rest (%class-hot class)))))
+                (let ((m (%entry-method (%tab-find! stab stab sel))))
+                  (if (null? m)
+                    (error (%str-append "object: no such method " (symbol->str sel)))
+                    (tail-eval
+                      (pair m (pair class (%append (rest args) (list (list (lit lit) obj)))))
+                      e))))
               (apply prior (pair obj (%data-echo (fn (_ a) (eval a e)) args))))))))))
 
 ; Install value-to-class method dispatch OVER a type's existing call handler:
@@ -5110,9 +5804,7 @@
   (fn (loop al)
     (if (not (null? al))
       (do
-        (display " ")
-        (display (first (first al)))
-        (display "=")
+        (display " " (first (first al)) "=")
         (write (rest (first al)))
         (loop (rest al))))))
 
@@ -5130,15 +5822,12 @@
 
 (def %class-write
   (fn (_ self)
-    (display "#<class ")
-    (display (class-name self))
-    (display ">")))
+    (display "#<class " (class-name self) ">")))
 
 ; Default dump for a class that defines no %repr.
 (def %object-default-write
   (fn (_ self)
-    (display "#<")
-    (display (class-name self))
+    (display "#<" (class-name self))
     (%write-fields (%obj-fields self))
     (display ">")))
 
@@ -5165,17 +5854,26 @@
 (note "Inheritance")
 
 (doc (def super
-  (op (self-expr sel-raw . rest) e
+  (op (self-expr sel-raw . args) e
     (let ((inst (eval self-expr e)) (selector (%selector sel-raw)))
       (if (not (object? inst))
         (error "object: super works only inside an instance method")
-        ; %super-class is the parent of the class that DEFINED this method (bound by
-        ; def-class in the method's scope), so super resolves to the right level even
-        ; when the method is inherited by a deeper subclass -- no self-recursion.
-        (let ((method (%lookup (eval (lit %super-class) e) (lit methods) selector)))
-          (if (null? method)
-            (error "object: super has no parent method")
-            (apply method (pair inst (%map1 (fn (_ a) (eval a e)) rest)))))))))
+        ; The parent comes from %this-class -- the box every method body
+        ; binds to its DEFINING class -- so super resolves to the right
+        ; level even when the method is inherited by a deeper subclass:
+        ; no self-recursion.
+        ; Resolution goes through the parent's flat itab (chain-merged, so a
+        ; grandparent method is found exactly as the old chain walk did); a
+        ; field marker is not a method. tail-eval re-drives the call: raw
+        ; arg forms evaluate once, with no per-arg eval closure or apply.
+        (let ((sc (let ((b (eval (lit %this-class) e)))
+                    (if (null? b) () (class-parent (first b))))))
+          (let ((method (if (null? sc) ()
+                          (let ((itab (first (%class-hot sc))))
+                            (%tab-find! itab itab selector)))))
+            (if (if (null? method) #t (eq? method %field-tag))
+              (error "object: super has no parent method")
+              (tail-eval (pair method (pair inst args)) e))))))))
   (note "Selector is literal: (super self method args...). Instance methods only.")
   (note "Resolves from the parent of the method's DEFINING class, so it is correct")
   (note "through multi-level inheritance.")
@@ -5197,11 +5895,28 @@
   (op (target-expr sel) e
     (let ((target (eval target-expr e)))
       (fn (_ . args)
-        (eval
-          (pair (list (lit lit) target)
-            (pair (list (lit lit) sel)
-              (%map1 (fn (_ a) (list (lit lit) a)) args)))
-          e)))))
+        ; Late-bound by contract: resolve per call (so a rebuilt table is
+        ; honoured), but through the flat tables -- a method hit applies the
+        ; closure directly on the already-evaluated args, no form rebuild.
+        ; A member (field marker) or non-class target falls back to driving
+        ; the normal dispatch form, values spliced as (lit V) literals so
+        ; nothing re-evaluates.
+        (let ((entry
+                (%entry-method
+                  (if (class? target)
+                    (let ((stab (first (rest (%class-hot target)))))
+                      (%tab-find! stab stab sel))
+                    (if (object? target)
+                      (let ((itab (first (%class-hot (%obj-class target)))))
+                        (%tab-find! itab itab sel))
+                      ())))))
+          (if (null? entry)
+            (eval
+              (pair (list (lit lit) target)
+                (pair (list (lit lit) sel)
+                  (%map1 (fn (_ a) (list (lit lit) a)) args)))
+              e)
+            (apply entry (pair target args))))))))
   (note "Selector is literal: (method-ref Class method). Works for static and instance methods.")
   (example "(List map (method-ref Str upcase) (list \"a\" \"b\"))" "(\"A\" \"B\")")
   (see def-class)
@@ -5284,7 +5999,7 @@
 (note "Class definition")
 
 (def %make-class
-  (fn (_ name fields methods parent s-methods statics interface)
+  (fn (_ name fields methods parent s-methods statics interface ivis svis)
     (%make-instance %class
       (list
         (pair (lit name) name)
@@ -5293,6 +6008,8 @@
         (pair (lit parent) parent)
         (pair (lit s-methods) s-methods)
         (pair (lit interface) interface)           ; declared (interface ...) names, or ()
+        (pair (lit ivis) ivis)                     ; instance-side (name . private|protected)
+        (pair (lit svis) svis)                     ; static-side visibility alist
         (pair (lit statics) (list statics))))))   ; statics in a one-cell mutable box
 
 ; Find a top-level body form whose head is `tag`, returning its rest (or ()).
@@ -5388,11 +6105,7 @@
 
 ; The class-level (doc "desc" meta...) form in a class body, or () if absent.
 (def %find-doc-form
-  (fn (loop body)
-    (unless (null? body)
-      (if (%class-doc-form? (first body))
-        (first body)
-        (loop (rest body))))))
+  (fn (_ body) (%find %class-doc-form? body)))
 
 ; Stash a class-level (doc "desc" meta...) under the bare class name, so
 ; (help Class) shows a summary above the member/method sections. DESC may be
@@ -5439,13 +6152,18 @@
             (loop (rest sig))))
         sig))))   ; dotted-rest tail passes through
 
-; Build a method closure from (NAME (self . params) body...). The body is wrapped
-; in a let binding %super-class (the parent of the defining class, used by super)
-; and, for instance methods (raw? true), the raw member/set-member! accessors.
-; A leading (doc ...) body form and inline (param ...) signature annotations are
-; stripped here (their registration happens in %collect-methods).
+; Build a method closure from (NAME (self . params) body...). The body is
+; wrapped in a let binding %this-class -- a one-cell box def-class fills
+; with the class object once it exists (methods are built BEFORE the class;
+; the box breaks the cycle). super reads the defining class's parent from
+; it; the privacy check reads the caller's class from it. For instance
+; methods (raw? true) the raw member/set-member! accessors ride the same
+; let. A leading (doc ...) body form and inline (param ...) signature
+; annotations are stripped here (their registration happens in
+; %collect-methods). The box is spliced as (lit BOX): a raw pair in value
+; position would evaluate as a form.
 (def %make-method
-  (fn (_ form raw? parent e)
+  (fn (_ form raw? tbox e)
     (let ((sig  (%strip-sig-params (first (rest (rest form)))))
           (body (if (%method-has-doc? form)
                   (rest (rest (rest (rest form))))     ; drop leading (doc ...)
@@ -5454,7 +6172,7 @@
         (list (lit fn)
           (pair (lit recur) sig)                       ; (recur . user-params)
           (pair (lit let)
-            (pair (pair (list (lit %super-class) parent)
+            (pair (pair (list (lit %this-class) (list (lit lit) tbox))
                     (when raw? %method-raw-bindings))
                   body)))
         e))))
@@ -5464,7 +6182,7 @@
 ; super). class-name keys any per-method docs. Registers a doc entry for each
 ; documented method as a side effect.
 (def %collect-methods
-  (fn (loop class-name forms raw? parent e)
+  (fn (loop class-name forms raw? tbox e)
     (unless (null? forms)
       ; Guard the head test: a bare member name is a SYMBOL, and first on a
       ; non-pair is unchecked -- (first 'x) yields the name buffer as an
@@ -5475,9 +6193,9 @@
           (when (%method-has-doc? (first forms))
             (%stash-method-doc! class-name (first forms)))
           (pair (pair (first (rest (first forms)))
-                      (%make-method (first forms) raw? parent e))
-                (loop class-name (rest forms) raw? parent e)))
-        (loop class-name (rest forms) raw? parent e)))))
+                      (%make-method (first forms) raw? tbox e))
+                (loop class-name (rest forms) raw? tbox e)))
+        (loop class-name (rest forms) raw? tbox e)))))
 
 ; A member declaration is  NAME  |  (NAME default).  Its doc, if any, comes from
 ; a separate (doc DECL "desc" meta...) form (see %member-doc-form? above), so a
@@ -5516,7 +6234,9 @@
               (if (eq? (first f) (lit method)) #t
                 (if (eq? (first f) (lit static)) #t
                   (if (eq? (first f) (lit interface)) #t
-                    (%class-doc-form? f))))          ; skip methods, statics, interface, class doc
+                    (if (eq? (first f) (lit with)) #t
+                      (if (eq? (first f) (lit delegates)) #t
+                        (%class-doc-form? f))))))    ; skip methods/statics/interface/with/delegates/class doc
               #f)
           (loop class-name (rest forms) e thunk?)
           (let ((decl (%member-decl f)))
@@ -5529,7 +6249,18 @@
 (def %resolve-parent
   (fn (_ parent e)
     (unless (null? parent)
-      (eval (first (rest parent)) e))))
+      (do
+        ; The documented parent slot is () or (extends Class) (see the
+        ; def-class doc).  Anything else -- a bare (Parent) list, a bare
+        ; symbol, (extends) with no class -- used to reach (first ())
+        ; through the UNCHECKED C first and segfault at class-def time;
+        ; refuse loudly instead.
+        (unless (if (pair? parent)
+                  (if (eq? (first parent) (lit extends))
+                    (pair? (rest parent)) #f)
+                  #f)
+          (error "def-class: parents are declared () or (extends Class)"))
+        (eval (first (rest parent)) e)))))
 
 ; A body form is a member NAME (symbol), or a list headed by a symbol --
 ; (method ...), (static ...), or a (NAME value ...) member declaration.
@@ -5561,17 +6292,13 @@
 
 (def %class-interface (fn (_ c) (%assoc-get (lit interface) (%class-data c))))
 
-(def %name-in?
-  (fn (loop name names)
-    (if (null? names) #f
-      (if (eq? (first names) name) #t (loop name (rest names))))))
 
 ; m is among c's OWN methods -- instance OR static (the string protocol's
 ; primitives are static; instance-based interfaces use instance methods).
 (def %defines?
   (fn (_ c m)
-    (if (%name-in? m (%assoc-keys (%assoc-get (lit methods) (%class-data c)))) #t
-      (%name-in? m (%assoc-keys (%assoc-get (lit s-methods) (%class-data c)))))))
+    (if (%memq? m (%assoc-keys (%assoc-get (lit methods) (%class-data c)))) #t
+      (%memq? m (%assoc-keys (%assoc-get (lit s-methods) (%class-data c)))))))
 
 ; #t if c's chain provides a concrete impl of method m: some class defines m
 ; (instance or static) but does NOT list it in its own interface (so the abstract
@@ -5579,7 +6306,7 @@
 (def %implements?
   (fn (loop c m)
     (if (null? c) #f
-      (if (if (%defines? c m) (not (%name-in? m (%class-interface c))) #f)
+      (if (if (%defines? c m) (not (%memq? m (%class-interface c))) #f)
         #t
         (loop (%assoc-get (lit parent) (%class-data c)) m)))))
 
@@ -5608,23 +6335,176 @@
 ; any inherited interface. Kept out of the def-class op body so the op's tail
 ; stays the bare tail-eval (see below).
 (def %build-class
-  (fn (_ name parent body e)
+  (fn (_ name parent body0 e)
     (do
+      ; Explode (private ...) / (protected ...) declaration blocks: their
+      ; tail forms splice in place and each declared name is recorded in a
+      ; visibility alist for the flattener. Blocks work at the body top
+      ; level (instance side) and inside (static ...); nesting the other
+      ; way round is refused. LOCAL fns, mid-body on purpose (the
+      ; %check-dups! pattern below).
+      (def %block-vis
+        (fn (_ f)
+          (if (pair? f)
+            (if (eq? (first f) (lit private)) (lit private)
+              (if (eq? (first f) (lit protected)) (lit protected) ()))
+            ())))
+      (def %decl-name
+        (fn (_ f)
+          (if (if (pair? f) (eq? (first f) (lit method)) #f)
+            (first (rest f))
+            (%member-name (%member-decl f)))))
+      (def %explode-vis                    ; forms -> (spliced-forms . vis-alist)
+        (fn (loop fs)
+          (match
+            ((null? fs) (pair () ()))
+            ((not (null? (%block-vis (first fs))))
+              (let ((vis (%block-vis (first fs)))
+                    (bodyf (rest (first fs)))
+                    (outer (loop (rest fs))))
+                (do
+                  (%map (fn (_ f)
+                          (when (if (pair? f) (eq? (first f) (lit static)) #f)
+                            (error "def-class: declare (private ...) inside (static ...), not the reverse")))
+                    bodyf)
+                  (pair (%append2 bodyf (first outer))
+                        (%append2 (%map (fn (_ f) (pair (%decl-name f) vis)) bodyf)
+                                  (rest outer))))))
+            (#t
+              (let ((outer (loop (rest fs))))
+                (pair (pair (first fs) (first outer)) (rest outer)))))))
+      (def %ix (%explode-vis body0))
+      (def body (first %ix))
+      (def ivis (rest %ix))
       (%validate-body body)
+      ; A member name declared twice in ONE class body is always a mistake
+      ; -- the common shape is a bare declaration beside its (doc NAME ...)
+      ; form, which ALSO declares (see %collect-members).  The duplicate is
+      ; silent poison: positional construction fills the doubled slot twice
+      ; and a LATER member stays nil (found via (Type wrap ...): `raw`
+      ; stayed nil and a downstream (first nil) segfaulted).  Subclass
+      ; overrides are unaffected -- one body's own list only, never the
+      ; chain.  LOCAL fns, mid-body on purpose: the file's %-global budget
+      ; is spent, class building is cold, and a mid-body def is
+      ; activation-scoped (only TAIL defs leak globally under TCO).
+      (def %member-key?
+        (fn (loop n ms)
+          (if (null? ms) #f
+            (if (eq? n (first (first ms))) #t (loop n (rest ms))))))
+      (def %check-dups!
+        (fn (loop ms)
+          (unless (null? ms)
+            (do
+              (when (%member-key? (first (first ms)) (rest ms))
+                (error (%str-append (symbol->str name)
+                  (%str-append ": duplicate member "
+                    (%str-append (symbol->str (first (first ms)))
+                      " -- declared twice in one class body (a (doc NAME ...) form also declares)")))))
+              (loop (rest ms))))))
       (let ((dform (%find-doc-form body)))           ; class-level (doc ...) -> doc registry
         (unless (null? dform) (%stash-class-doc! name dform)))
+      (def %sx (%explode-vis (%find-form body (lit static))))
+      ; Traits (x/type/trait): every (with T...) form's traits, in order.
+      ; Their stored method FORMS build with the ordinary builder against
+      ; THIS class's box -- super resolves on the host's chain -- in the
+      ; TRAIT's captured env, so the body's free names resolve where the
+      ; trait was written. Contributions append AFTER own methods: the
+      ; flattener's first-sight rule makes own > trait > inherited. Two
+      ; traits supplying one selector with no own override refuse here,
+      ; naming both. `delegates` forwarders ride the same append.
+      (def %with-traits
+        (fn (loop fs acc)
+          (match
+            ((null? fs) acc)
+            ((if (pair? (first fs)) (eq? (first (first fs)) (lit with)) #f)
+              (loop (rest fs)
+                (%append2 acc
+                  (%map (fn (_ tx)
+                          (let ((t (eval tx e)))
+                            ; the trait tag is a pair whose head is the
+                            ; interned symbol %trait (trait.x's unforgeable
+                            ; list); shape-checked here because the tag
+                            ; value itself lives in a later-loading module
+                            (if (if (pair? t)
+                                  (if (pair? (first t)) (eq? (first (first t)) (lit %trait)) #f)
+                                  #f)
+                              t
+                              (error "def-class: (with ...) takes trait values (see def-trait)"))))
+                    (rest (first fs))))))
+            (#t (loop (rest fs) acc)))))
+      (def %trait-conflict!
+        (fn (loop rows own seen)
+          (unless (null? rows)
+            (do
+              (let ((sel (first (first rows))))
+                (unless (%member-key? sel own)
+                  (when (%member-key? sel seen)
+                    (error (%str-append (symbol->str name)
+                      (%str-append ": traits collide on "
+                        (%str-append (symbol->str sel) " -- add an own override")))))))
+              (loop (rest rows) own (pair (first rows) seen))))))
+      (def %delegates-methods
+        (fn (loop fs acc)
+          (match
+            ((null? fs) acc)
+            ((if (pair? (first fs)) (eq? (first (first fs)) (lit delegates)) #f)
+              (let ((acc2 (%append2 acc
+                            (%map (fn (_ spec)
+                                    (let ((theirs (if (pair? spec) (first spec) spec))
+                                          (ours (if (pair? spec) (first (rest spec)) spec)))
+                                      (pair ours
+                                        (eval
+                                          (list (lit fn)
+                                            (pair (lit _) (pair (lit self) (lit args)))
+                                            (list (lit %delegate-call)
+                                              (list (lit self) (list (lit lit) (first (rest (first fs)))))
+                                              (list (lit lit) theirs)
+                                              (lit args)))
+                                          e))))
+                              (first (rest (rest (first fs))))))))
+                (loop (rest fs) acc2)))
+            (#t (loop (rest fs) acc)))))
       (let ((p (%resolve-parent parent e))
-            (sblock (%find-form body (lit static))))
-        (let ((cls (%make-class
-                     name
-                     (%collect-members name body e #t)      ; instance members: per-construction defaults
-                     (%collect-methods name body #t p e)    ; instance methods: raw access + super
-                     p
-                     (%collect-methods name sblock #f p e)  ; static methods
-                     (%collect-members name sblock e #f)    ; static members: once, class-wide
-                     (%find-form body (lit interface)))))   ; declared interface (or ())
-          (%check-interface! cls)                            ; error if a contract method is unmet
-          cls)))))
+            (sblock (first %sx))
+            (svis (rest %sx))
+            (traits (%with-traits body ()))
+            (tbox (list ())))                          ; %this-class box, filled below
+        (let ((imems (%collect-members name body e #t))    ; instance members: per-construction defaults
+              (smems (%collect-members name sblock e #f))) ; static members: once, class-wide
+          (do
+            (%check-dups! imems)
+            (%check-dups! smems)
+            (let ((own-im (%collect-methods name body #t tbox e))
+                  (own-sm (%collect-methods name sblock #f tbox e))
+                  (t-im (%fold (fn (_ acc t)
+                                 (%append2 acc (%collect-methods name (first (rest (rest (rest t)))) #t tbox
+                                                 (first (rest (rest (rest (rest (rest t)))))))))
+                          () traits))
+                  (t-sm (%fold (fn (_ acc t)
+                                 (%append2 acc (%collect-methods name (first (rest (rest (rest (rest t))))) #f tbox
+                                                 (first (rest (rest (rest (rest (rest t)))))))))
+                          () traits)))
+              (%trait-conflict! t-im own-im ())
+              (%trait-conflict! t-sm own-sm ())
+              (let ((cls (%make-class
+                           name
+                           imems
+                           (%append2 own-im (%append2 t-im (%delegates-methods body ())))
+                           p
+                           (%append2 own-sm t-sm)
+                           smems
+                           (%find-form body (lit interface))          ; declared interface (or ())
+                           ivis svis)))
+                (%set-first! tbox cls)                             ; methods can now see their class
+                (%check-interface! cls)                            ; error if a contract method is unmet
+                ; Trait requirements: each (require SEL...) name needs a
+                ; concrete definition somewhere on the chain (trait- and
+                ; delegate-supplied methods are in the tables by now).
+                (%for-each
+                  (fn (_ t) (%check-impls! cls (first (rest (rest t)))))
+                  traits)
+                (%set-first! %class-registry (pair cls (first %class-registry)))
+                cls))))))))
 
 (doc (def def-class
   (op (name parent . body)
@@ -5642,6 +6522,9 @@
   (note "  (method NAME (self . args) body...)      instance method")
   (note "  (static MEMBER... (method ...)...)       class-wide members + static methods")
   (note "  (interface NAME...)                      abstract: a concrete subclass must implement each NAME")
+  (note "  (private DECL...) | (protected DECL...)  visibility blocks (members and methods; also inside (static ...)):")
+  (note "                                           private = defining class's methods only; protected = its chain.")
+  (note "                                           Enforced at the dispatch door; introspection and (help) still list them.")
   (note "  (doc \"summary\" (note ..) (see ..) (example ..))   class-level docs, shown by (help Class)")
   (note "A method shadows a member of the same name. Parent: () or (extends Class).")
   (note "Inside a method, (self m) accesses members; (member 'm)/(set-member! 'm v) are raw.")
@@ -5720,7 +6603,7 @@
                 (loop (rest members) inits e eval?)))))))
 
 (doc (provide x/type/class
-  def-class new new-from super method-ref
+  def-class new new-from super method-ref method-of
   object? class? class-of class-name class-parent instance-of?
   class-members class-methods class-static-members class-static-methods
   %class-call-handler %bind-call-over!)
@@ -5734,6 +6617,76 @@
   (example "(do (def-class P () x (method get (self) (self x))) ((new P x 5) get))" "5")
   "Object-oriented class system: classes-as-objects, message passing, single inheritance.")
 ; ---- end lib/x/type/class.x ----
+; Records: def-record, lightweight named-field data types over def-class.
+; ---- begin lib/x/type/record.x ----
+; record.x -- def-record: lightweight named-field data types.
+;
+; A record IS a class (instances are plain objects): no new runtime type,
+; because make-type registrations prepend to the reader-priority type alist
+; -- a per-record tokenization tax -- and a parallel instance kind would
+; fork every downstream facility (write, iter, equal?, help) that already
+; understands objects. def-record is sugar over def-class plus the two
+; methods a data carrier wants:
+;
+;   (def-record Span start len (colour ()))
+;   (def s (new Span 3 5))            ; the ordinary positional/keyword ctor
+;   (s start)                          ; field access, the ordinary door
+;   (s with 'len 9)                    ; functional update -> a NEW record
+;   (s =? (new Span 3 5))              ; structural equality, field by field
+;
+; `with` keys are QUOTED: with is an ordinary method, so its arguments
+; evaluate -- a bare name would be looked up, not taken literally (new's
+; bare keys work because new is an operative).
+;
+; Records are leaves: extending one is spelled def-class. Structural
+; equality is a METHOD -- eq?/same? keep identity semantics, by ruling.
+(import x/type/class)
+
+; Functional update: copy the record with the named fields replaced.
+; new-from takes the store as data, and an unknown key fails loudly
+; through the ordinary %check-init-keys door. The overrides plist rides
+; in front of the current fields alist, so its entries win the walk.
+(def %record-with
+  (fn (_ self overrides)
+    (new-from (class-of self)
+      (%append2 overrides (%obj-fields self)))))
+
+; Structural equality: the same class (identity -- a record equals no
+; other type), then equal? over the field alists, which sit in
+; construction order on both sides.
+(def %record=?
+  (fn (_ self other)
+    (if (not (object? other)) #f
+      (if (not (same? (class-of self) (class-of other))) #f
+        (equal? (%obj-fields self) (%obj-fields other))))))
+
+(def %record-methods
+  (lit ((method with (self . overrides) (%record-with self overrides))
+        (method =? (self other) (%record=? self other)))))
+
+(doc (def def-record
+  (op (name . fields) e
+    ; Expand to def-class with the two record methods appended, then
+    ; tail-eval so the (def NAME ...) persists in the caller's env (the
+    ; def-class placement rule).
+    (tail-eval
+      (pair (lit def-class)
+        (pair name (pair () (%append2 fields %record-methods))))
+      e)))
+  (note "Fields: NAME | (NAME default), exactly as def-class members.")
+  (note "Construction, access, and update ride the ordinary class doors:")
+  (note "  (new R v1 v2 ...) positional/keyword; (r field) reads; (r field v) writes in place;")
+  (note "  (r with 'field v ...) copies with replacements (keys quoted -- with is a")
+  (note "  method, so its args evaluate); (r =? other) is structural, field by field.")
+  (note "Records are leaves -- to extend one, write the def-class out.")
+  (example "(do (def-record Pt x y) (def p (new Pt 1 2)) (list (p x) ((p with 'y 9) y) (p =? (new Pt 1 2))))" "(1 9 #t)")
+  (see def-class)
+  "Define a lightweight named-field record type (a class with with/=? built in).")
+
+(doc (provide x/type/record def-record)
+  (example "(do (def-record Pt x y) ((new Pt 1 2) y))" "2")
+  "Lightweight named-field records over the class system.")
+; ---- end lib/x/type/record.x ----
 ; Convert: the conversion dispatcher (registered in the catalog as
 ; (convert . to)) + the Convert class with the no-match policy member.
 ; Relocated past object.x from the early type-internals block -- it needs
@@ -5746,7 +6699,7 @@
 ; Three concerns, one mechanism each:
 ;   - The TYPE SYSTEM carries the data: each type struct's cvt group holds a
 ;     from-alist (source-type -> converter) and a to-alist (target-type ->
-;     converter), set with the %type-set-from!/%type-set-to! helpers below.
+;     converter), set with the %type-set-from! helper below.
 ;   - The CATALOG carries the implementation: %convert-to is registered as
 ;     (convert . to); hot consumers (the tower's coercions, reader and write
 ;     handlers) fetch-and-cache it at module load:
@@ -5815,9 +6768,6 @@
 (def %type-set-from!
   (fn (_ ts alist) (%set-first! (%type-from-cell ts) alist)))
 
-; Set the to alist on a type struct
-(def %type-set-to!
-  (fn (_ ts alist) (%set-first! (%type-to-cell ts) alist)))
 
 ; --- Type handles ---
 (def %int    (%type-of 0))
@@ -5871,12 +6821,9 @@
     (pair #t (fn (_ v . extra) (%obj->ptr v)))))
 
 ; --- The dispatcher ---
-(def %alist-find
-  (fn (self alist key)
-    (if (null? alist) ()
-      (if (eq? (first (first alist)) key)
-        (first alist)
-        (self (rest alist) key)))))
+; Entry lookup is the canonical %assq (core/alist.x, #227): this file
+; loads at x-core.x:144, after alist.x:126, and the dispatcher only runs
+; at call time anyway.
 
 ; Locals are bound with `let`, NOT `def`.  This body sits in the fn's tail
 ; position, and a `def` in a tail context runs *after* TCO has popped the
@@ -5897,10 +6844,10 @@
               (if (null? from-al) ()
                 (do
                   (if (null? source) ()
-                    (set! entry (%alist-find from-al source)))
+                    (set! entry (%assq source from-al)))
                   ; Wildcard: #t key
                   (if (null? entry)
-                    (set! entry (%alist-find from-al #t))
+                    (set! entry (%assq #t from-al))
                     ())))))
           ; Outbound: target in source's to-alist
           (if (null? entry)
@@ -5909,7 +6856,7 @@
                 (if (null? source-ts) ()
                   (let ((to-al (first (%type-to-cell source-ts))))
                     (if (null? to-al) ()
-                      (set! entry (%alist-find to-al target)))))))
+                      (set! entry (%assq target to-al)))))))
             ())
           ; Call converter: (fn (_ . val) . extra); a miss is the dialect's
           ; policy, not ours -- read it off the class (cold path only).
@@ -5954,7 +6901,96 @@
 (import x/type/class)
 
 (def-class Type ()
+  (doc "Type-system reflection: construction, lookup, struct navigation, and handler-stack wiring. (Type wrap t) clothes a handle or struct as an interactive instance: (t name), (t cell 'type-write-stack), (t push-write f)."
+    (example "((Type wrap (Type of 0)) name)" "\"INTEGER\""))
+  (doc handle "The type's handle atom -- the name atom (Type of) answers and the type-alist keys.")
+  (doc raw "The raw type struct (tree) -- what the cell walkers and push-* wiring consume.")
+  (method name (self)
+    (doc "This type's registered name."
+      (returns STRING "The name")
+      (example "((Type wrap (Type of 0)) name)" "\"INTEGER\""))
+    ((prim-ref (lit type) (lit name)) (self handle)))
+  (method cell (self (param fname SYMBOL "A type field name -- see (Type fields)"))
+    (doc "The object the layout contract's path addresses for fname, walked from this type's struct. A handler-stack cell's first slot is the handler list."
+      (returns ANY "The addressed cell/object")
+      (example "(null? ((Type wrap (Type of 0)) cell 'type-write-stack))" "#f"))
+    (Type %layout-cell (self raw) fname (lit type)))
+  (method fields (self)
+    (doc "Every type field name from the layout contract."
+      (returns LIST "Field name symbols, contract order"))
+    (Type %layout-fields (lit type)))
+  (method push-write (self (param f CALLABLE "Write handler (fn (_ obj) ...)"))
+    (doc "Push a write handler onto this type's write stack (shadows the current one)." (returns ANY "nil"))
+    ((prim-ref (lit type) (lit push-write)) (self raw) f))
+  (method push-display (self (param f CALLABLE "Display handler"))
+    (doc "Push a display handler onto this type's display stack." (returns ANY "nil"))
+    ((prim-ref (lit type) (lit push-display)) (self raw) f))
+  (method push-call (self (param f CALLABLE "Call handler (fn (_ obj . args) ...)"))
+    (doc "Push a call handler onto this type's call stack (overrides how (obj ...) dispatches)." (returns ANY "nil"))
+    ((prim-ref (lit type) (lit push-call)) (self raw) f))
+  (method push-op (self (param op ATOM "Operator symbol, e.g. '+")
+                        (param f CALLABLE "Binary handler (fn (_ a b) ...)"))
+    (doc "Register a binary generic-operator handler on this type." (returns ANY "nil"))
+    ((prim-ref (lit type) (lit push-op)) (self raw) op f))
+  (method %repr (self)
+    (doc "Inspection form: #<type:NAME>." (returns STRING "The repr string"))
+    (Str8 append "#<type:"
+      (Str8 append ((prim-ref (lit type) (lit name)) (self handle)) ">")))
   (static
+    ; --- layout-contract walkers (shared: type/base.x calls these; homed
+    ; here as %-statics per the percent-globals budget -- classes ARE
+    ; namespaces).  Contract rows (engine/tools/contract/base-paths.x) are
+    ; (name root step...).  Cell resolution REFUSES a name whose root
+    ; walks a different shape: a type-rooted name stepped from a base (or
+    ; vice versa) addresses arbitrary spine words, and a consumer
+    ; mutating "its cell" would overwrite live interpreter state.
+    (method %layout-entry (self fname paths)
+      (doc "The contract row for fname, or nil." (returns ANY "The (name root step...) row"))
+      (match
+        ((null? paths) ())
+        ((eq? (first (first paths)) fname) (first paths))
+        (#t (recur self fname (rest paths)))))
+    (method %layout-cell (self o fname root)
+      (doc "The object addressed by fname's contract path, walked from o; errors unless the row's root is `root`."
+        (returns ANY "The addressed cell/object"))
+      (let ((e (Type %layout-entry fname %base-paths)))
+        (match
+          ((null? e) (error (pair (lit layout-cell-unknown-field) fname)))
+          ((not (eq? (first (rest e)) root))
+            (error (pair (lit layout-cell-wrong-root) fname)))
+          (#t (%reflect-step o (rest (rest e)))))))
+    (method %layout-fields (self root)
+      (doc "Every contract field name whose row has root `root`, contract order."
+        (returns LIST "Name symbols"))
+      (def %go
+        (fn (loop paths)
+          (match
+            ((null? paths) ())
+            ((eq? (first (rest (first paths))) root)
+              (pair (first (first paths)) (loop (rest paths))))
+            (#t (loop (rest paths))))))
+      (%go %base-paths))
+    (method wrap (self (param t ANY "A type handle (from Type of) or type struct (from Type by-atom)"))
+      (doc "Clothe a type as a Type instance for interactive use."
+        (returns OBJECT "The Type instance; handle/raw members hold both forms")
+        (example "((Type wrap (Type of 0)) name)" "\"INTEGER\""))
+      (match
+        ((null? t) (error (lit type-wrap-nil)))
+        ((eq? (%reflect-type-word t) %reflect-spair-tw)
+          (let ((handle (%reflect-type-tree-name t)) (raw t))
+            (new Type handle handle raw raw)))
+        (#t
+          (let ((handle t) (raw ((prim-ref (lit type) (lit by-atom)) t)))
+            (new Type handle handle raw raw)))))
+    (method fields (self)
+      (doc "Every type field name in the layout contract (type-rooted rows of engine/tools/contract/base-paths.x)."
+        (returns LIST "Field name symbols, contract order"))
+      (Type %layout-fields (lit type)))
+    (method cell (self (param ts ANY "Type struct (from Type by-atom)")
+                       (param fname SYMBOL "A field name -- see (Type fields)"))
+      (doc "The layout-contract cell for name, walked from struct ts. Refuses non-type-rooted names."
+        (returns ANY "The addressed cell/object"))
+      (Type %layout-cell ts fname (lit type)))
     (method make (self (param name STRING "Type name (e.g. \"POINT\")")
                        (param slots LIST "Handler alist: (call write display analyse read delimit iter ops from to ...)"))
       (doc "Create a new custom type with the given handler slots; the reader checks it before the built-ins."
@@ -6067,6 +7103,7 @@
 
 (doc (provide x/type/type Type)
   (note "Mechanism in lib/x/type/struct.x, filed under catalog ns `type`; load-time wiring fetch-and-caches the helpers instead of calling the class.")
+  (note "(Type wrap t) makes a type interactive: (t name), (t cell 'type-write-stack), (t fields), (t push-write f). Field names come from the layout contract (engine/tools/contract/base-paths.x); (Type fields) lists them.")
   "Type-system reflection: construction, lookup, struct navigation, and handler-stack wiring on the Type class.")
 ; ---- end lib/x/type/type.x ----
 ; Obj: the raw object layer (slots, metadata, FFI handles) as the Obj class.
@@ -6132,6 +7169,9 @@
 ; de-registered; reader-hot modules fetch-and-cache the prims.
 ; ---- begin lib/x/type/buf.x ----
 ; type/buf.x -- Buf + Tok: the tokenizer buffer and token-stream API.
+; One of the four I/O tiers -- Io holds the verbs, Stream redirects
+; output, File is the filesystem, Buf is the reader's side; the full
+; statement lives in x/type/io.x's header (#365).
 ;
 ; The C primitives live in src/x-prim/type.c (catalog ns `buf` and `tok`);
 ; the methods fetch inline per the cold rule. Both namespaces are
@@ -6184,10 +7224,13 @@
       (doc "Read one token from a buffer through the type system's analysers."
         (returns ANY "The parsed token"))
       ((prim-ref (lit tok) (lit read)) buffer))
-    (method read-str (self (param base ANY "Base object with type alist") (param s STRING "Source string to tokenize"))
+    (method read-str (self (param base ANY "Base object with type alist (Base instance or raw)") (param s STRING "Source string to tokenize"))
       (doc "Tokenize a string using a base's type system."
         (returns LIST "List of parsed tokens"))
-      ((prim-ref (lit tok) (lit read-str)) base s))))
+      ; The C prim consumes a RAW base; a Base instance unwraps here (the
+      ; tokenizer seam).  Base is late-bound on purpose -- type/base.x
+      ; loads after this module, and nothing calls read-str mid-boot.
+      ((prim-ref (lit tok) (lit read-str)) (Base raw-of base) s))))
 
 (doc (provide x/type/buf Buf Tok)
   (note "ns `buf`/`tok` are de-registered; reader-hot callers fetch-and-cache the prims, never class-dispatch per token.")
@@ -6235,6 +7278,12 @@
       (doc "Copy the NUL-terminated C string at P into a fresh x-lang string."
         (returns STRING "A new string (survives the C buffer)"))
       ((prim-ref (lit ptr) (lit ->str)) p))
+    ; The engine reads this as a memcpy of `width` bytes into the low end of a
+    ; zeroed machine int (x_prim_ptr_ref, src/x-prim/ffi.c).  On a big-endian
+    ; host those bytes land in the HIGH end and any width below the full word
+    ; reads wrong -- which is what "little-endian" in the doc below means.
+    ; ref-word is exempt: a full-width copy has no byte-order question.
+    ; constraint: endian = little -- widening (ptr ref) is a low-end memcpy
     (method ref (self (param p PTR "Base pointer") (param off INT "Byte offset")
                       (param width INT "Read width in bytes (1,2,4,8)"))
       (doc "Read a WIDTH-byte little-endian value at P+OFF."
@@ -6286,6 +7335,22 @@
 ; write/display (kept bare via the keep-list); the rest fetch-and-cache.
 ; ---- begin lib/x/type/io.x ----
 ; type/io.x -- Io: the input/output surface.
+;
+; THE I/O TIERS (#365) -- four classes, four jobs:
+;   Io     (this file)      the VERBS on the current channels: write/
+;                           display (also bare), read/read-char, the
+;                           to-str captures, error-line/file, repl-read.
+;   Stream (x/sys/stream)   WHERE output goes: redirect the output verbs
+;                           to an fd or file (to-fd/to-file/with-...).
+;   File   (x/sys/file)     the FILESYSTEM: descriptors and raw ops
+;                           (open/read/write/seek), plus the ergonomic
+;                           whole-file tier (read-all/stat/walk/...).
+;   Buf    (x/type/buf)     the READER's side: the tokenizer's non-owning
+;                           buffer view and the Tok token stream -- input
+;                           machinery, not general I/O.
+; Rule of thumb: printing or reading values -> Io; sending output
+; somewhere else -> Stream; touching the filesystem -> File; writing a
+; reader -> Buf.
 ;
 ; The C primitives live in src/x-prim/io.c (catalog ns `io`). ns `io` is
 ; DE-REGISTERED (R5) -- EXCEPT `write` and `display`, the universal output
@@ -6443,7 +7508,7 @@
 (def-class Num ()
   (static
     (method int? (self (param x ANY "Value to test"))
-      (doc "Test whether x is a machine INT -- the base integer type. Floats, rationals, bignums, booleans, and nil are not (N5: counts and indexes are machine INTs)."
+      (doc "Test whether x is a machine INT -- the base integer type. Floats, rationals, bigints, booleans, and nil are not (N5: counts and indexes are machine INTs)."
         (returns BOOL "#t only for machine integers")
         (example "(list (Num int? 3) (Num int? ()))" "(#t #f)"))
       (if (null? x) #f (eq? (%num-type-of x) %num-int-type)))
@@ -6661,6 +7726,9 @@
       (#t al))))
 
 (def-class Assoc ()
+  (doc "Persistent association lists: every operation returns a NEW alist, the input untouched."
+    (note "The verb rule (#358): persistent operations carry bare verbs (put/del) because nothing mutates; the mutating twins live on Dict with the bang (set!/del!). Same data shape, opposite update models -- pick by whether callers share the structure.")
+    (example "(Assoc get 'b (Assoc put 'b 2 (list (pair 'a 1))))" "2"))
   (static
     ; --- Lookup ---
     (method get (self (param key SYMBOL "Key to look up") (param alist LIST "Association list"))
@@ -6761,6 +7829,22 @@
             (pair (first entry) (transform (rest entry)))))
         alist))
     ; --- Option stores ---
+    (method entry (self (param key ANY "Key to search for, compared with eq?")
+                        (param alist LIST "Association list"))
+      (doc "The (key . value) entry itself, by identity (eq?), or nil -- the presence-unambiguous entry door (a hit is always a pair); get is the value door. Was (List assq), #357."
+        (returns ANY "The matching entry pair, or nil")
+        (example "(Assoc entry 'b (list (pair 'a 1) (pair 'b 2)))" "('b . 2)"))
+      (if (null? alist) ()
+        (if (eq? key (first (first alist))) (first alist) (recur self key (rest alist)))))
+
+    (method find (self (param key ANY "Key to search for, compared with equal?")
+                       (param alist LIST "Association list"))
+      (doc "The (key . value) entry itself, by equality (equal?), or nil. String and number keys hit here and miss the eq?-keyed doors (get/entry). Was (List assoc), #357."
+        (returns ANY "The matching entry pair, or nil")
+        (example "(Assoc find \"b\" (list (pair \"a\" 1) (pair \"b\" 2)))" "(\"b\" . 2)"))
+      (if (null? alist) ()
+        (if (equal? key (first (first alist))) (first alist) (recur self key (rest alist)))))
+
     (method opt-get-or (self (param d ANY "Default value if key is absent")
                              (param key SYMBOL "Key to look up")
                              (param store LIST "Option store: alist or flat plist"))
@@ -6852,7 +7936,733 @@
 
 (import x/type/class)
 (import x/core/alist)
-(import x/platform/syscall)
+(%module-loaded! (lit x/platform/syscall))
+; ---- begin lib/x/platform/syscall.x ----
+; syscall.x -- x86_64, i386, and Darwin/BSD syscall tables
+; lint-known: %param-os %param-arch
+; STRING SPELLINGS: %-private byte helpers, NOT Str8 -- the table-selection
+; walk below RUNS AT LOAD, and posix.x pulls this file into the x-core boot
+; before str8.x exists (#108 strings round: a class call here is boot death).
+(import x/core/list)
+(import x/core/alist)
+
+; The three tables live under platform/data/ (#38: this file was 95%
+; literal data); import registers the names so later imports no-op -- and
+; resolves through the import roots, so the tables load in an installed
+; tree too (no root-relative path literals at runtime).
+(%module-loaded! (lit x/platform/data/syscalls-x86_64))
+; ---- begin lib/x/platform/data/syscalls-x86_64.x ----
+; platform/data/syscalls-x86_64.x -- the Linux x86_64 syscall name table (#38: split from
+; platform/syscall.x, which was 95% literal data). One table per file,
+; loaded by syscall.x via include-once; boot-constrained (loads
+; mid-x-core through sys/posix.x), so boot accessors only.
+
+; x86_64 syscall name table (267 entries, index = syscall number)
+
+(def x86_64-syscall-names
+  (lit (
+    read
+    write
+    open
+    close
+    stat
+    fstat
+    lstat
+    poll
+    lseek
+    mmap
+    mprotect
+    munmap
+    brk
+    rt_sigaction
+    rt_sigprocmask
+    rt_sigreturn
+    ioctl
+    pread64
+    pwrite64
+    readv
+    writev
+    access
+    pipe
+    select
+    sched_yield
+    mremap
+    msync
+    mincore
+    madvise
+    shmget
+    shmat
+    shmctl
+    dup
+    dup2
+    pause
+    nanosleep
+    getitimer
+    alarm
+    setitimer
+    getpid
+    sendfile
+    socket
+    connect
+    accept
+    sendto
+    recvfrom
+    sendmsg
+    recvmsg
+    shutdown
+    bind
+    listen
+    getsockname
+    getpeername
+    socketpair
+    setsockopt
+    getsockopt
+    clone
+    fork
+    vfork
+    execve
+    exit
+    wait4
+    kill
+    uname
+    semget
+    semop
+    semctl
+    shmdt
+    msgget
+    msgsnd
+    msgrcv
+    msgctl
+    fcntl
+    flock
+    fsync
+    fdatasync
+    truncate
+    ftruncate
+    getdents
+    getcwd
+    chdir
+    fchdir
+    rename
+    mkdir
+    rmdir
+    creat
+    link
+    unlink
+    symlink
+    readlink
+    chmod
+    fchmod
+    chown
+    fchown
+    lchown
+    umask
+    gettimeofday
+    getrlimit
+    getrusage
+    sysinfo
+    times
+    ptrace
+    getuid
+    syslog
+    getgid
+    setuid
+    setgid
+    geteuid
+    getegid
+    setpgid
+    getppid
+    getpgrp
+    setsid
+    setreuid
+    setregid
+    getgroups
+    setgroups
+    setresuid
+    getresuid
+    setresgid
+    getresgid
+    getpgid
+    setfsuid
+    setfsgid
+    getsid
+    capget
+    capset
+    rt_sigpending
+    rt_sigtimedwait
+    rt_sigqueueinfo
+    rt_sigsuspend
+    sigaltstack
+    utime
+    mknod
+    uselib
+    personality
+    ustat
+    statfs
+    fstatfs
+    sysfs
+    getpriority
+    setpriority
+    sched_setparam
+    sched_getparam
+    sched_setscheduler
+    sched_getscheduler
+    sched_get_priority_max
+    sched_get_priority_min
+    sched_rr_get_interval
+    mlock
+    munlock
+    mlockall
+    munlockall
+    vhangup
+    modify_ldt
+    pivot_root
+    _sysctl
+    prctl
+    arch_prctl
+    adjtimex
+    setrlimit
+    chroot
+    sync
+    acct
+    settimeofday
+    mount
+    umount2
+    swapon
+    swapoff
+    reboot
+    sethostname
+    setdomainname
+    iopl
+    ioperm
+    create_module
+    init_module
+    delete_module
+    get_kernel_syms
+    query_module
+    quotactl
+    nfsservctl
+    getpmsg
+    putpmsg
+    afs_syscall
+    tuxcall
+    security
+    gettid
+    readahead
+    setxattr
+    lsetxattr
+    fsetxattr
+    getxattr
+    lgetxattr
+    fgetxattr
+    listxattr
+    llistxattr
+    flistxattr
+    removexattr
+    lremovexattr
+    fremovexattr
+    tkill
+    time
+    futex
+    sched_setaffinity
+    sched_getaffinity
+    set_thread_area
+    io_setup
+    io_destroy
+    io_getevents
+    io_submit
+    io_cancel
+    get_thread_area
+    lookup_dcookie
+    epoll_create
+    epoll_ctl_old
+    epoll_wait_old
+    remap_file_pages
+    getdents64
+    set_tid_address
+    restart_syscall
+    semtimedop
+    fadvise64
+    timer_create
+    timer_settime
+    timer_gettime
+    timer_getoverrun
+    timer_delete
+    clock_settime
+    clock_gettime
+    clock_getres
+    clock_nanosleep
+    exit_group
+    epoll_wait
+    epoll_ctl
+    tgkill
+    utimes
+    vserver
+    mbind
+    set_mempolicy
+    get_mempolicy
+    mq_open
+    mq_unlink
+    mq_timedsend
+    mq_timedreceive
+    mq_notify
+    mq_getsetattr
+    kexec_load
+    waitid
+    add_key
+    request_key
+    keyctl
+    ioprio_set
+    ioprio_get
+    inotify_init
+    inotify_add_watch
+    inotify_rm_watch
+    migrate_pages
+    openat
+    mkdirat
+    mknodat
+    fchownat
+    futimesat
+    newfstatat
+    unlinkat
+    renameat
+    linkat
+    symlinkat
+    readlinkat
+    fchmodat
+    faccessat
+    pselect6
+    ppoll
+    unshare
+    set_robust_list
+    get_robust_list
+    splice
+    tee
+    sync_file_range
+    vmsplice
+    move_pages
+    utimensat
+    epoll_pwait
+    signalfd
+    timerfd_create
+    eventfd
+    fallocate
+    timerfd_settime
+    timerfd_gettime
+    accept4
+    signalfd4
+    eventfd2
+    epoll_create1
+    dup3
+    pipe2
+    inotify_init1
+    preadv
+    pwritev
+    rt_tgsigqueueinfo
+    perf_event_open
+    recvmmsg
+    fanotify_init
+    fanotify_mark
+    prlimit64
+    name_to_handle_at
+    open_by_handle_at
+    clock_adjtime
+    syncfs
+    sendmmsg
+    setns
+    getcpu
+    process_vm_readv
+    process_vm_writev
+    kcmp
+    finit_module
+  )))
+; ---- end lib/x/platform/data/syscalls-x86_64.x ----
+(%module-loaded! (lit x/platform/data/syscalls-i386))
+; ---- begin lib/x/platform/data/syscalls-i386.x ----
+; platform/data/syscalls-i386.x -- the Linux i386 syscall name table (#38: split from
+; platform/syscall.x, which was 95% literal data). One table per file,
+; loaded by syscall.x via include-once; boot-constrained (loads
+; mid-x-core through sys/posix.x), so boot accessors only.
+
+; i386 / BSD / Darwin syscall name table (index = syscall number)
+
+
+(def i386-syscall-names
+  (lit (
+    none
+    exit
+    fork
+    read
+    write
+    open
+    close
+    waitpid
+    creat
+    link
+    unlink
+    execve
+    chdir
+    time
+    mknod
+    chmod
+    lchown
+    nil
+    stat
+    lseek
+    getpid
+    mount
+    oldmount
+    setuid
+    getuid
+    stime
+    ptrace
+    alarm
+    fstat
+    pause
+    utime
+    nil
+    nil
+    access
+    nice
+    nil
+    sync
+    kill
+    rename
+    mkdir
+    rmdir
+    dup
+    pipe
+    times
+    nil
+    brk
+    setgid
+    getgid
+    signal
+    geteuid
+    getegid
+    acct
+    umount
+    nil
+    ioctl
+    fcntl
+    nil
+    setpgid
+    nil
+    olduname
+    umask
+    chroot
+    ustat
+    dup2
+    getppid
+    getpgrp
+    setsid
+    sigaction
+    sgetmask
+    ssetmask
+    setreuid
+    setregid
+    sigsuspend
+    sigpending
+    sethostname
+    setrlimit
+    getrlimit
+    getrusage
+    gettimeofday
+    settimeofday
+    getgroups
+    setgroups
+    oldselect
+    symlink
+    lstat
+    readlink
+    uselib
+    swapon
+    reboot
+    readdir
+    mmap
+    munmap
+    truncate
+    ftruncate
+    fchmod
+    fchown
+    getpriority
+    setpriority
+    nil
+    statfs
+    fstatfs
+    ioperm
+    socketcall
+    syslog
+    setitimer
+    getitimer
+    stat
+    lstat
+    fstat
+    uname
+    iopl
+    vhangup
+    idle
+    vm86old
+    wait4
+    swapoff
+    sysinfo
+    ipc
+    fsync
+    sigreturn
+    clone
+    setdomainname
+    uname
+    modify-ldt
+    adjtimex
+    mprotect
+    sigprocmask
+    create-module
+    init-module
+    delete-module
+    get-kernel-syms
+    quotactl
+    getpgid
+    fchdir
+    bdflush
+    sysfs
+    personality
+    nil
+    setfsuid
+    getfsgid
+    llseek
+    getdents
+    select
+    flock
+    msync
+    readv
+    writev
+    getsid
+    fdatasync
+    sysctl
+    mlock
+    munlock
+    mlockall
+    munlockall
+    sched-setparam
+    sched-getparam
+    sched-setscheduler
+    sched-getscheduler
+    sched-yield
+    sched-get-priority-max
+    sched-get-priority-min
+    sched-rr-get-interval
+    nanosleep
+    mremap
+    setresuid
+    getresuid
+    vm86
+    query-module
+    poll
+    nfsservctl
+    setresgid
+    getresgid
+    prctl
+    rt-sigreturn
+    rt-sigaction
+    rt-sigprocmask
+    rt-sigpending
+    rt-sigtimedwait
+    rt-sigqueueinfo
+    rt-sigsuspend
+    pread
+    pwrite
+    chown
+    getcwd
+    capget
+    capset
+    sigaltstack
+    sendfile
+    nil
+    nil
+    vfork
+  )))
+; ---- end lib/x/platform/data/syscalls-i386.x ----
+(%module-loaded! (lit x/platform/data/syscalls-darwin))
+; ---- begin lib/x/platform/data/syscalls-darwin.x ----
+; platform/data/syscalls-darwin.x -- the Darwin/BSD syscall-number alist (#38: split from
+; platform/syscall.x, which was 95% literal data). One table per file,
+; loaded by syscall.x via include-once; boot-constrained (loads
+; mid-x-core through sys/posix.x), so boot accessors only.
+
+; Darwin/BSD syscall numbers (from <sys/syscall.h>). Bare numbers: macOS libc
+; syscall() OR-folds the UNIX class (0x2000000), so the bare BSD number reaches
+; the kernel (verified: syscall(5,...) opens). BSD numbers are sparse, so an
+; alist rather than the index=number lists the Linux tables use. Subset File
+; needs, plus a few common calls.
+(def darwin-syscall-numbers
+  (list
+    (list (lit exit)   1)  (list (lit fork)  2)
+    (list (lit read)   3)  (list (lit write) 4)
+    (list (lit open)   5)  (list (lit close) 6)
+    (list (lit wait4)  7)  (list (lit unlink) 10)
+    (list (lit execve) 59) (list (lit rename) 128)
+    (list (lit mkdir)  136) (list (lit rmdir) 137)
+    (list (lit stat)   188) (list (lit fstat) 189) (list (lit lstat) 190)
+    (list (lit lseek)  199) (list (lit ftruncate) 201)
+    ; 64-bit-inode variants (#22): the plain stat trio above returns the
+    ; LEGACY 32-bit-ino struct on Darwin; stat64/fstat64/lstat64 return the
+    ; layout File stat decodes (mode@4 mtime@48 size@96).  getdirentries64
+    ; is Darwin's dirent reader (Linux uses getdents64 from the index table).
+    (list (lit stat64) 338) (list (lit fstat64) 339) (list (lit lstat64) 340)
+    (list (lit getdirentries64) 344)
+    ; wall clock (#21): the timeval decode is OS-shared (sec i64@0; usec
+    ; fits the low u32@8 on both -- Darwin's tv_usec is a 32-bit field,
+    ; Linux's is an i64 whose value is < 1e6).
+    (list (lit gettimeofday) 116)))
+
+; syscall-id: look up a syscall number by name. On Darwin, use the BSD alist;
+; elsewhere the x86_64 index table (falling back to i386). Returns the number,
+; or -1 if not found.
+; ---- end lib/x/platform/data/syscalls-darwin.x ----
+
+; --- platform detection ---
+; x-machine is the build triple, e.g. "arm64-apple-darwin25.5.0" vs
+; "x86_64-linux-gnu". macOS uses BSD syscall numbers AND different O_* flag
+; values, so the file layer keys off this too.
+;
+; Boot-level byte search, NOT (Str8 includes?): this platform layer loads
+; mid-x-core (sys/posix.x imports it, before the str8 protocol exists), so it
+; may use only the boot string accessors. With a not-yet-callable Str8, the
+; old form silently captured the UNEVALUATED list -- truthy, so it looked
+; right on darwin and would have mis-detected Linux.
+(def %os-substr-at?
+  (fn (loop needle hay i j)
+    (match
+      ((>= j (%str-length needle)) #t)
+      ((eq? (%str-ref hay (+ i j)) (%str-ref needle j)) (loop needle hay i (+ j 1)))
+      (#t #f))))
+(def %os-contains?
+  (fn (loop needle hay i)
+    (match
+      ((> (+ i (%str-length needle)) (%str-length hay)) #f)
+      ((%os-substr-at? needle hay i 0) #t)
+      (#t (loop needle hay (+ i 1))))))
+; DECLARED PARAMS WIN; the triple parse below is the fallback.  The engine's
+; build writes what it knows -- os, arch, word size, byte order -- from the
+; COMPILER producing the binary, and the wrapper emits those as data ahead of the
+; boot (the route %install-root takes, because this layer runs before any file
+; I/O exists).  Reading a declaration is the point: a cross-compiled engine
+; reports its TARGET, where sniffing a triple at runtime reports whatever string
+; the build happened to embed.
+;
+; `guard` because the rows are absent in two legitimate cases -- an engine whose
+; build could not establish a fact writes `unknown` and the wrapper omits it, and
+; an older install tree has no declaration at all.  Absent is not wrong; it means
+; fall back to reading the triple, which is what this layer did before and still
+; can.
+(def %declared-os (guard (_ ()) %param-os))
+(def %declared-arch (guard (_ ()) %param-arch))
+
+(def os-darwin?
+  (match ((eq? %declared-os ()) (%os-contains? "darwin" x-machine 0))
+         (#t (eq? %declared-os (lit darwin)))))
+(def os-linux?
+  (match ((eq? %declared-os ()) (%os-contains? "linux" x-machine 0))
+         (#t (eq? %declared-os (lit linux)))))
+
+; --- architecture, parsed HERE and only here ---
+; The same triple carries the arch, and it used to be re-sniffed wherever
+; someone needed it: lib/x/tool/asm.x had its own darwin test and its own arm64
+; test, lib/x/tool/compile.x had a third darwin test.  Three readings of one
+; string, and only one of them knew that Darwin spells A64 "arm64" while GNU
+; triplets spell it "aarch64" -- so a module that copied the wrong one would
+; work on a Mac and mis-detect everywhere else.  The triple is parsed once, and
+; tools/check/platform-seam.sh holds it to once.
+;
+; SNIFFING A TRIPLE IS THE INTERIM, NOT THE DESIGN.  What an engine should hand
+; over is a declared (param arch ...) row -- a fact it knows at build time
+; rather than a substring of a string it happens to print.  x-engine.xon omits
+; params on purpose (they are facts of a BUILD, not of a source tree) and they
+; are stamped beside the installed binary.  When that source exists, this is the
+; one place that changes.
+(def arch-arm64?
+  (match ((eq? %declared-arch ())
+           (if (%os-contains? "arm64" x-machine 0) #t
+             (%os-contains? "aarch64" x-machine 0)))
+         (#t (eq? %declared-arch (lit arm64)))))
+(def arch-x86-64?
+  (match ((eq? %declared-arch ()) (%os-contains? "x86_64" x-machine 0))
+         (#t (eq? %declared-arch (lit x86-64)))))
+
+; --- File open-mode flags (O_*) ---
+; PLATFORM truth: the O_* flag VALUES differ by OS (verified: macOS
+; O_CREAT=512 / O_TRUNC=1024 vs Linux 64 / 512), so there is one table per
+; platform and %file-modes picks at load via os-darwin?.  Consumed by
+; sys/file.x (the (File file-modes) method + symbolic open modes) and
+; sys/posix.x (its libc open() calls).  Formerly C-bound %O_* constants;
+; retired with the ISA audit -- platform data is policy and lives in X.
+(def %file-modes-linux (list
+  (list (lit accmode)    3)        ; 00000003
+  (list (lit rdonly)     0)        ; 00000000
+  (list (lit wronly)     1)        ; 00000001
+  (list (lit rdwr)       2)        ; 00000002
+  (list (lit creat)      64)       ; 00000100
+  (list (lit excl)       128)      ; 00000200
+  (list (lit noctty)     256)      ; 00000400
+  (list (lit trunc)      512)      ; 00001000
+  (list (lit append)     1024)     ; 00002000
+  (list (lit nonblock)   2048)     ; 00004000
+  (list (lit dsync)      4096)     ; 00010000
+  (list (lit fasync)     8192)     ; 00020000
+  (list (lit direct)     16384)    ; 00040000
+  (list (lit largefile)  32768)    ; 00100000
+  (list (lit directory)  65536)    ; 00200000
+  (list (lit nofollow)   131072)   ; 00400000
+  (list (lit noatime)    262144)   ; 01000000
+  (list (lit cloexec)    524288)   ; 02000000
+  (list (lit sync)       1048576)  ; 04000000
+  (list (lit path)       2097152)))  ; 010000000
+
+; Darwin/macOS O_* flag values (from <sys/fcntl.h>) -- note the divergence from
+; Linux (creat/trunc/excl especially). Subset File needs plus common flags;
+; Linux-only flags (dsync/direct/largefile/noatime/path/...) are omitted.
+(def %file-modes-darwin (list
+  (list (lit accmode)   3)          ; 0x0003
+  (list (lit rdonly)    0)          ; 0x0000
+  (list (lit wronly)    1)          ; 0x0001
+  (list (lit rdwr)      2)          ; 0x0002
+  (list (lit nonblock)  4)          ; 0x0004
+  (list (lit append)    8)          ; 0x0008
+  (list (lit nofollow)  256)        ; 0x0100
+  (list (lit creat)     512)        ; 0x0200
+  (list (lit trunc)     1024)       ; 0x0400
+  (list (lit excl)      2048)       ; 0x0800
+  (list (lit noctty)    131072)     ; 0x20000
+  (list (lit directory) 1048576)    ; 0x100000
+  (list (lit cloexec)   16777216))) ; 0x1000000
+
+; Select the table for this OS at load.  Both probes explicit: an
+; unrecognized platform must fail loudly here, not silently run with Linux
+; flag values (wrong O_* values corrupt the interpreter via raw syscalls).
+(def %file-modes
+  (match
+    (os-darwin? %file-modes-darwin)
+    (os-linux? %file-modes-linux)
+    (#t (error (pair (lit unsupported-platform) x-machine)))))
+
+(def syscall-id
+  (fn (_ call)
+    (if os-darwin?
+      (let ((e (%assoc-get call darwin-syscall-numbers)))
+        (if (null? e) -1 (first e)))
+      ; index-of misses with nil; -1 stays this table's OS-domain invalid
+      ; marker (never a valid syscall number)
+      (let ((n (List index-of call x86_64-syscall-names)))
+        (if (null? n)
+          (let ((m (List index-of call i386-syscall-names)))
+            (if (null? m) -1 m))
+          n)))))
+
+(doc (provide x/platform/syscall
+  syscall-id os-darwin? x86_64-syscall-names i386-syscall-names darwin-syscall-numbers)
+  (note "syscall-id is platform-aware: Darwin -> bare BSD numbers (libc OR-folds the 0x2000000 UNIX class), else Linux x86_64/i386. os-darwin? is the platform flag (from x-machine).")
+  "Syscall number tables for x86_64, i386, and Darwin/BSD. Maps symbolic names to syscall numbers.")
+; ---- end lib/x/platform/syscall.x ----
 
 ; O_* open flags from the platform table (%file-modes, x/platform/syscall) --
 ; the single source of platform truth, shared with sys/file.x.  Formerly
@@ -6906,6 +8716,7 @@
 
 (def %c-pipe (%resolve "pipe"))
 
+
 (def %c-dup2 (%resolve "dup2"))
 
 (def %c-waitpid (%resolve "waitpid"))
@@ -6945,13 +8756,18 @@
       (doc "Terminate the process with the given exit status.")
       (%ptr-call %c-exit status))
     (method wait (self (param pid INT "Process ID to wait for"))
-      (doc "Wait for a child process and return its exit status."
-        (returns INT "Exit status of the child process"))
-      (let ((buf (%cvt (%ptr-call %c-malloc 4) %ptr)))
-        (%ptr-call %c-waitpid pid buf 0)
-        (let ((raw (%ptr-ref buf 0 4)))
-          (%ptr-call %c-free buf)
-          (/ (% raw 65536) 256))))
+      (doc "Wait for a child and return how it ended."
+        (returns INT "Exit status 0-255 for a normal exit; 128+N when signal N killed the child (the shell convention)")
+        (note "The old contract returned WEXITSTATUS unconditionally, so a signal-killed child reported 0 -- success (#226)."))
+      ; Status word lands in a GC-owned (str make) region (see pipe).
+      ; Low 7 bits = the killing signal, 0 for a normal exit; the exit
+      ; code rides bits 8-15.
+      (let ((s (%make-str 4)))
+        (let ((buf (%str->ptr s)))
+          (%ptr-call %c-waitpid pid buf 0)
+          (let ((raw (%ptr-ref buf 0 4)))
+            (let ((sig (% raw 128)))
+              (if (= sig 0) (/ (% raw 65536) 256) (+ 128 sig)))))))
     (method exec (self (param name STRING "Program name") (param args LIST "List of argument strings"))
       (doc "Replace the current process with the named program. Does not return on success.")
       (let ((all (pair name args)))
@@ -6969,6 +8785,27 @@
                     (self (rest lst) (+ i 1))))))
             (%fill all 0)
             (%sys-fold (%ptr-call %c-execvp name argv))))))
+    ; --- Signals ---
+    ; POSIX-fixed numbers (identical on Darwin and Linux); named here so
+    ; call sites stop carrying magic 2/1/15 literals (#226).
+    (sigint 2 "SIGINT: terminal interrupt (ctrl-c)")
+    (sigkill 9 "SIGKILL: uncatchable, unignorable kill")
+    (sigterm 15 "SIGTERM: polite termination request")
+    (sig-dfl 0 "signal(2) disposition: restore the default action")
+    (sig-ign 1 "signal(2) disposition: ignore the signal")
+    (method kill (self (param pid INT "Process ID")
+                       (param sig INT "Signal number, e.g. (Sys sigterm)"))
+      (doc "Send a signal to a process." (returns INT "0 on success, -1 on error"))
+      ; Cold path: resolve per call (the file-exists? pattern), keeping
+      ; the module inside its %-globals budget.
+      (%sys-fold (%ptr-call (%resolve "kill") pid sig)))
+    (method signal (self (param sig INT "Signal number")
+                         (param disposition INT "(Sys sig-ign) or (Sys sig-dfl) ONLY -- an x-lang closure cannot be a C signal handler"))
+      (doc "Set a signal's disposition to ignore or default."
+        (returns ANY "The previous disposition; meaningful only when it was one of the two constants"))
+      ; signal(2) returns a POINTER (the old handler) -- never %sys-fold
+      ; a pointer return (see the fold's comment above).
+      (%ptr-call (%resolve "signal") sig disposition))
     ; --- File descriptors ---
     (method close (self (param fd INT "File descriptor to close"))
       (doc "Close a file descriptor." (returns INT "0 on success, -1 on error"))
@@ -7017,20 +8854,56 @@
               (if (< i 0) acc
                 (go (- i 1) (pair (& (%ptr-ref buf i 1) 255) acc))))))))
     (method file-exists? (self (param path STRING "File path to check"))
-      (doc "Check if a file exists (via access with F_OK=0)." (returns BOOL "True if file exists"))
+      (doc "Check if a file exists (via access with F_OK=0)."
+        (returns BOOL "True if file exists")
+        (note "Deliberately duplicated across tiers with (File exists?) (#361): boot/module.x resolves imports through THIS door before sys/file (stat + Err, the ergonomic sibling) can load. Post-boot callers doing file work generally want the File class."))
       (= (%sys-fold (%ptr-call (%resolve "access") path 0)) 0))
     ; --- Environment ---
     (method chdir (self (param path STRING "Directory path"))
-      (doc "Change the current working directory." (returns INT "0 on success, -1 on error"))
+      (doc "Change the current working directory -- (Sys getcwd) reads it back." (returns INT "0 on success, -1 on error"))
       (%sys-fold (%ptr-call %c-chdir path)))
+    (method getcwd (self)
+      (doc "The current working directory (getcwd) -- the symmetric half of (Sys chdir) (#361)."
+        (returns STRING "Absolute path, or nil on failure")
+        (sample "(Sys getcwd)" "\"/home/user/project\""))
+      ; POINTER return (the buffer on success, NULL on failure) -- must NOT
+      ; go through %sys-fold (see its comment). Cold path: resolve per call.
+      (let ((s (%make-str 4096)))
+        (let ((r (%ptr-call (%resolve "getcwd") (%str->ptr s) 4096)))
+          (if (= r 0) () (%cvt (%cvt r %ptr) %string)))))
     (method setenv (self (param name STRING "Variable name") (param val STRING "Variable value"))
-      (doc "Set an environment variable, overwriting any existing value." (returns INT "0 on success, -1 on error"))
+      (doc "Set an environment variable, overwriting any existing value -- (Sys unsetenv) removes it." (returns INT "0 on success, -1 on error"))
       (%sys-fold (%ptr-call %c-setenv name val 1)))
     (method getenv (self (param name STRING "Variable name"))
       (doc "Get the value of an environment variable." (returns STRING "Variable value, or nil if not set"))
       ; POINTER return -- must NOT go through %sys-fold (see its comment).
       (let ((result (%ptr-call %c-getenv name)))
         (if (= result 0) () (%cvt (%cvt result %ptr) %string))))
+    (method unsetenv (self (param name STRING "Variable name"))
+      (doc "Remove an environment variable -- the symmetric half of (Sys setenv) (#361). Removing an absent name succeeds."
+        (returns INT "0 on success, -1 on error"))
+      (%sys-fold (%ptr-call (%resolve "unsetenv") name)))
+    (method environ (self)
+      (doc "The whole environment as a list of \"NAME=VALUE\" strings, in table order (#361). Split an entry at its FIRST '=' only -- values may themselves contain '='."
+        (returns LIST "\"NAME=VALUE\" strings")
+        (sample "(Sys environ)" "(\"HOME=/home/user\" \"TERM=xterm-256color\" ...)"))
+      ; environ is a DATA symbol: deref the char** once, then walk word by
+      ; word (byte offsets, %word-size stride) to the NULL terminator; each
+      ; entry is a C-string pointer. Pointer values throughout -- no fold.
+      (let ((envp (%ptr-ref (%resolve "environ") 0 %word-size)))
+        (let go ((i 0) (acc ()))
+          (let ((e (%ptr-ref (%cvt envp %ptr) (* i %word-size) %word-size)))
+            (if (= e 0) (%reverse acc)
+              (go (+ i 1) (pair (%cvt (%cvt e %ptr) %string) acc)))))))
+    ; --- Sleep (#361) ---
+    (method sleep (self (param seconds INT "Whole seconds to block"))
+      (doc "Block for the given number of seconds (libc sleep). A signal can wake it early; sub-second waits are (Sys usleep)."
+        (returns INT "0 after the full interval; the seconds left unslept when a signal woke it early"))
+      (%sys-fold (%ptr-call (%resolve "sleep") seconds)))
+    (method usleep (self (param micros INT "Microseconds to block"))
+      (doc "Block for the given number of microseconds (libc usleep) -- the sub-second door; whole seconds read better through (Sys sleep)."
+        (returns INT "0 on success, -1 on error"))
+      (%sys-fold (%ptr-call (%resolve "usleep") micros)))
     (method isatty (self (param fd NUMBER "File descriptor to test"))
       (doc "Test whether a file descriptor refers to a terminal (TTY)."
         (returns BOOL "True if fd refers to a terminal")
@@ -7063,6 +8936,10 @@
     ; libc gettimeofday into a GC-owned 16-byte buffer; the timeval decode
     ; is OS-shared: tv_sec is an i64 at 0 on both; tv_usec at 8 fits a u32
     ; read on both (Darwin's field IS 32-bit; Linux's is an i64 < 1e6).
+    ; That is the 64-bit timeval; a 32-bit one puts tv_usec at 4, and the
+    ; 4-byte usec read is a widening (ptr ref) -- host byte order.
+    ; constraint: word-size = 8 -- struct timeval field offsets are 64-bit
+    ; constraint: endian = little -- widening (ptr ref) of tv_usec
     (method time-of-day (self)
       (doc "Wall-clock time from gettimeofday: (unix-seconds . microseconds)."
         (returns PAIR "(seconds . microseconds)")
@@ -7379,20 +9256,22 @@
     (method alphabetic? (self (param c CHAR "Character to test"))
       (doc "Test whether a character is alphabetic." (returns BOOL "True if c is a letter A-Z or a-z"))
       (let ((n (%char->integer c)))
-        (or (and (>= n 65) (<= n 90)) (and (>= n 97) (<= n 122)))))
+        ; Nested if, NOT and/or (#343): per character via the Str8
+        ; upcase/downcase/trim walks.
+        (if (if (>= n 65) (<= n 90) #f) #t (if (>= n 97) (<= n 122) #f))))
     (method numeric? (self (param c CHAR "Character to test"))
       (doc "Test whether a character is a digit." (returns BOOL "True if c is a digit 0-9"))
-      (let ((n (%char->integer c))) (and (>= n 48) (<= n 57))))
+      (let ((n (%char->integer c))) (if (>= n 48) (<= n 57) #f)))
     (method whitespace? (self (param c CHAR "Character to test"))
       (doc "Test whether a character is whitespace (space, tab, newline, CR, FF)." (returns BOOL "True if c is whitespace"))
       (let ((n (%char->integer c)))
-        (or (= n 32) (= n 9) (= n 10) (= n 13) (= n 12))))
+        (if (= n 32) #t (if (= n 9) #t (if (= n 10) #t (if (= n 13) #t (= n 12)))))))
     (method upper-case? (self (param c CHAR "Character to test"))
       (doc "Test whether a character is uppercase." (returns BOOL "True if c is uppercase A-Z"))
-      (let ((n (%char->integer c))) (and (>= n 65) (<= n 90))))
+      (let ((n (%char->integer c))) (if (>= n 65) (<= n 90) #f)))
     (method lower-case? (self (param c CHAR "Character to test"))
       (doc "Test whether a character is lowercase." (returns BOOL "True if c is lowercase a-z"))
-      (let ((n (%char->integer c))) (and (>= n 97) (<= n 122))))
+      (let ((n (%char->integer c))) (if (>= n 97) (<= n 122) #f)))
     ; --- Case conversion ---
     (method upcase (self (param c CHAR "Character to convert"))
       (doc "Convert a character to uppercase." (returns CHAR "Uppercase version of c, or c unchanged"))
@@ -7444,12 +9323,28 @@
   (note "ASCII only. Classification, case conversion, and comparison homed on the Char class.")
   "Character operations as the Char class.")
 ; ---- end lib/x/type/char.x ----
-; String library: the protocol classes (Str8/StrUTF8) + the Str entry point.
+; String library: the protocol classes (Str8/StrUtf8) + the Str entry point.
 ; Loaded AFTER the object system they are built on. (The low-level code-point
 ; layer in type/str-utf8.x already loaded earlier, before objects, for boot
 ; code that needs the list<->string conversions.)
 ; ---- begin lib/x/protocol/seq.x ----
 ; seq.x -- Seq: the base sequence protocol (cursor-based traversal)
+;
+; THE ITERATION TIERS (#365) -- three classes, three jobs:
+;   Seq  (this file)     DEFINE an encoding: subclass with three cursor
+;                        primitives (start/done?/step) and the derived
+;                        walk API arrives free -- Str8 and StrUtf8 are
+;                        the worked examples.
+;   Iter (x/type/iter)   DRIVE a sequence at runtime: the iterator
+;                        OBJECT every sequence type yields through its
+;                        iter slot; imperative next/empty? plus the
+;                        functional step view.
+;   Gen  (x/type/gen)    COMPOSE lazily: O(1) map/filter/take pipelines
+;                        over any of the above, materialising only when
+;                        a consumer drives them.
+; Rule of thumb: implementing a new encoding -> Seq; consuming elements
+; now -> Iter (or the sequence class's own methods); building a pipeline
+; -> Gen.
 (import x/type/class)
 ; Fetch the int->char cast from the catalog (ns `int` utility member de-registered, R5).
 (def %integer->char (prim-ref (lit int) (lit ->char)))
@@ -7504,9 +9399,13 @@
       (doc "Count the elements: the cursor-walk ACTION, from start to done. `length` is the property this action computes."
         (returns INT "Number of elements in v")
         (example "(Str8 count \"abc\")" "3"))
-      (let loop ((cur (self start v)) (n 0))
-        (if (self done? cur v) n
-          (loop (rest (self step cur v)) (+ n 1)))))
+      ; Handlers hoisted once per traversal (#332); the loop then pays
+      ; two direct applies per element instead of two full dispatches.
+      (def %donef (method-of self (lit done?)))
+      (def %stepf (method-of self (lit step)))
+      (let loop ((cur ((method-of self (lit start)) self v)) (n 0))
+        (if (%donef self cur v) n
+          (loop (rest (%stepf self cur v)) (%sc-int+ n 1)))))
 
     (method length (self (param v ANY "Value to measure"))
       (doc "Number of elements: the PROPERTY every finite collection exposes. The default is computed by the `count` walk in O(n); fixed-width encodings (e.g. Str8) override it in O(1)."
@@ -7517,18 +9416,22 @@
       (doc "Collect every element, in order, into a list."
         (returns LIST "List of v's elements")
         (example "(Str8 ->list \"ab\")" "(#\\a #\\b)"))
-      (let loop ((cur (self start v)) (acc ()))
-        (if (self done? cur v)
+      (def %donef (method-of self (lit done?)))
+      (def %stepf (method-of self (lit step)))
+      (let loop ((cur ((method-of self (lit start)) self v)) (acc ()))
+        (if (%donef self cur v)
           (%reverse acc)
-          (let ((s (self step cur v)))
+          (let ((s (%stepf self cur v)))
             (loop (rest s) (pair (first s) acc))))))
 
     (method for-each (self (param f CALLABLE "Applied to each element") (param v ANY "Value to traverse"))
       (doc "Apply f to each element in order, for its side effects; returns nil. Named for-each, matching List/Iter/Gen."
         (returns ANY "nil"))
-      (let loop ((cur (self start v)))
-        (if (self done? cur v) ()
-          (let ((s (self step cur v)))
+      (def %donef (method-of self (lit done?)))
+      (def %stepf (method-of self (lit step)))
+      (let loop ((cur ((method-of self (lit start)) self v)))
+        (if (%donef self cur v) ()
+          (let ((s (%stepf self cur v)))
             (f (first s))
             (loop (rest s))))))
 
@@ -7536,9 +9439,11 @@
       (doc "Left-fold: thread acc through the elements left to right, calling (f acc element) at each step."
         (returns ANY "The final accumulator")
         (example "(Str8 fold (fn (_ a c) (+ a 1)) 0 \"abc\")" "3"))
-      (let loop ((cur (self start v)) (a acc))
-        (if (self done? cur v) a
-          (let ((s (self step cur v)))
+      (def %donef (method-of self (lit done?)))
+      (def %stepf (method-of self (lit step)))
+      (let loop ((cur ((method-of self (lit start)) self v)) (a acc))
+        (if (%donef self cur v) a
+          (let ((s (%stepf self cur v)))
             (loop (rest s) (f a (first s)))))))
 
     ; --- encode direction (inverse of ->list) ---
@@ -7555,10 +9460,17 @@
       (doc "Encode a list of elements back into a string via char->bytes -- the dual of ->list, so (->str (->list v)) round-trips."
         (returns STRING "The encoded string")
         (example "(Str8 ->str (list #\\h #\\i))" "\"hi\""))
+      ; Reverse-prepend each element's bytes, reverse once (#333): the
+      ; per-element %append re-copied the whole accumulated byte list
+      ; -- O(n^2) pairs to encode an n-char string (this backs make,
+      ; upcase/downcase, reverse, and the pad family).
+      (def %rev-onto (fn (self l acc)
+        (match ((null? l) acc) (#t (self (rest l) (pair (first l) acc))))))
       (bytes->str
         (%map %integer->char
-          (%fold (fn (_ acc el) (%append acc (self char->bytes el)))
-                () elements))))))
+          (%reverse
+            (%fold (fn (_ acc el) (%rev-onto (self char->bytes el) acc))
+                  () elements)))))))
 
 (doc (provide x/protocol/seq Seq)
   (note "A subclass supplies start/done?/step (and char->bytes to encode); count, length, ->list, for-each, fold and ->str are derived. (help Seq) lists the methods.")
@@ -7566,6 +9478,9 @@
 ; ---- end lib/x/protocol/seq.x ----
 ; ---- begin lib/x/protocol/str/str8.x ----
 ; str/str8.x -- Str8: the 8-bit (byte) string class + the full string suite
+; lint-known: Float
+; (the numeric tower loads after this file; float-path methods reach
+;  Float lazily at call time)
 (import x/protocol/seq)
 ; Fetch the string prims from the catalog (ns `str` is de-registered, R5).
 (def %str-append (prim-ref (lit str) (lit append)))
@@ -7584,7 +9499,12 @@
 ; UTF-8 fragments yields valid UTF-8). Swept %-private from the bare `str`
 ; global in #108 (e322895); its public face is the (Str8 str ...) class
 ; method below, which $"..." interpolation also delegates to.
-(def %str-build (fn (_ . args) (%fold (fn (_ acc x) (%str-append acc (%display-to-str x))) "" args)))
+; One rendering pass, ONE concatenation (#333): the old fold re-copied
+; the whole accumulator per argument -- O(n^2) in the rendered length,
+; paid by every $"..." interpolation.
+(def %str-build
+  (fn (_ . args)
+    (%str-concat (%map %display-to-str args))))
 
 
 
@@ -7594,7 +9514,7 @@
 ;
 ; Three string PROTOCOLS:
 ;   Str8     -- always 8-bit bytes (this class)
-;   StrUTF8  -- always UTF-8 code points (subclass; overrides the primitives)
+;   StrUtf8  -- always UTF-8 code points (subclass; overrides the primitives)
 ;   Str      -- the AMBIENT protocol (currently = Str8); see provide below
 ;
 ; The suite is written ONCE here, expressed entirely through SELF primitives:
@@ -7635,6 +9555,13 @@
     (let ((k (%str8-cvt n %str8-int-type)))
       (if (if (null? k) #f (eq? (%str8-type-of k) %str8-int-type)) k (error what))))))
 
+; Per-element C arithmetic (#332): the catalog carries int < and = but
+; NO >= or > (a prim-ref miss is a SILENT nil, and a nil head returns
+; the form itself -- truthy -- so the first draft's done? was instantly
+; "true"; the whole suite went quietly wrong).  >= and > are spelled
+; via < below: (>= a b) = (if (< a b) #f #t), (> a b) = (< b a).
+; +/-/< and the mem/ptr doors reuse boot's cached set (#333).
+
 (def-class Str8 (extends Seq)
   (static
     ; --- primitives (8-bit byte view; handler-immune via str-byte-*) ---
@@ -7660,11 +9587,11 @@
         (if (< j (%str-byte-len v)) (%str-byte-ref v j)
           (Err raise (lit index) "Str8 ref: index out of range" ()))))
     (method sub    (self (param st INT "Start byte offset (0-based)") (param len INT "Number of bytes") (param v STRING "Source string"))
-      (doc "Substring of len bytes starting at byte offset st; st and len clamp to v's bounds (like StrUTF8 sub)."
+      (doc "Substring of len bytes starting at byte offset st; st and len clamp to v's bounds (like StrUtf8 sub)."
         (returns STRING "The len-byte slice of v from st")
         (example "(Str8 sub 1 3 \"hello\")" "\"ell\""))
       ; %str-byte-sub reads unchecked (heap over-read past the string), so the
-      ; clamping here is the x-lang guard, mirroring StrUTF8 sub's clamp.
+      ; clamping here is the x-lang guard, mirroring StrUtf8 sub's clamp.
       (def st2 (%str8->int st "Str8 sub: start not convertible to INT"))
       (def len2 (%str8->int len "Str8 sub: length not convertible to INT"))
       (%str8-check v "Str8 sub: not a string")
@@ -7673,7 +9600,7 @@
           (%str-byte-sub v s0
             (if (< len2 0) 0 (if (< len2 (- n s0)) len2 (- n s0)))))))
     (method slice  (self (param st INT "Start offset (0-based, inclusive)") (param end INT "End offset (exclusive)") (param v STRING "Source string"))
-      (doc "Substring [st, end) -- the slice convention (start/end-exclusive), delegating to sub (start/length). Dispatches through (self sub), so StrUTF8 slices code points."
+      (doc "Substring [st, end) -- the slice convention (start/end-exclusive), delegating to sub (start/length). Dispatches through (self sub), so StrUtf8 slices code points."
         (returns STRING "The [st, end) slice of v")
         (example "(Str8 slice 1 4 \"hello\")" "\"ell\""))
       (self sub st (- end st) v))
@@ -7687,14 +9614,18 @@
     ; The cursor is a BYTE offset for every subclass, so done? bounds against the
     ; raw byte length -- NOT (self length), which a code-point subclass overrides
     ; via count -> done?, an infinite recursion. start/done? are inherited
-    ; unchanged by StrUTF8; only step advances differently.
+    ; unchanged by StrUtf8; only step advances differently.
     ; The one guard on the cursor protocol: `start` runs once per traversal,
     ; so it covers every walker above it (->list, iter, upcase, downcase,
     ; reverse) for the cost of a single type compare -- while done?/step,
     ; which run per element, stay raw.
     (method start (self v)     (do (%str8-check v "Str8: not a string") 0))
-    (method done? (self cur v) (>= cur (%str-byte-len v)))
-    (method step  (self cur v) (pair (self ref cur v) (+ cur 1)))
+    (method done? (self cur v) (if (%sc-int< cur (%str-byte-len v)) #f #t))
+    ; Raw byte read (#332): the cursor protocol structurally bounds cur
+    ; (start type-checks, done? gates every step), the same trust model
+    ; as unchecked first/rest -- ref's per-call coercion and double
+    ; bounds check cost more than the read itself, per element.
+    (method step  (self cur v) (pair (%str-byte-ref v cur) (%sc-int+ cur 1)))
 
     ; encode: one byte element is its own low byte. Makes
     ; (Str8 ->str (Str8 ->list s)) an identity on the byte view.
@@ -7705,26 +9636,77 @@
       (doc "True if a and b have equal length and equal bytes."
         (returns BOOL "#t when a and b are byte-equal")
         (example "(Str8 =? \"ab\" \"ab\")" "#t"))
-      (if (= (self length a) (self length b))
-        (let go ((i 0) (n (self length a)))
-          (if (= i n) #t
-            (if (= (%char->integer (self ref i a))
-                   (%char->integer (self ref i b)))
-              (go (+ i 1) n) #f)))
-        #f))
+      ; Byte equality IS the contract, and boot str=? is already the
+      ; one-block-compare door (#332); the interpreted per-byte loop
+      ; paid ~10 evals per byte.  Type checks stay loud.
+      (do (%str8-check a "Str8 =?: not a string")
+          (%str8-check b "Str8 =?: not a string")
+          (str=? a b)))
 
-    ; does sub occur in s at element position pos?
+    ; does sub occur in s at element position pos?  For Str8 an element
+    ; position IS a byte position; StrUtf8 overrides with a code-point
+    ; translation onto the same byte door (#332).
     (method match-at? (self sub pos s)
-      (def sub-len (self length sub))
-      (if (> (+ pos sub-len) (self length s)) #f
-        (self =? (self sub pos sub-len s) sub)))
+      (self %match-bytes-at? sub pos s))
+    ; The byte door: bounds, then ONE block compare -- no substring
+    ; allocation per probe.  Raw ptrs derive and land in the same
+    ; expression; collection is explicit-only (the str=? grounds).
+    (method %match-bytes-at? (self sub bpos s)
+      (def m (%str-byte-len sub))
+      (if (%sc-int< bpos 0) #f
+        (if (%sc-int< (%str-byte-len s) (%sc-int+ bpos m)) #f
+          (eq? 0 (%mem-cmp (%int->ptr (%sc-int+ (%ptr->int (%str->ptr s)) bpos))
+                           (%str->ptr sub) m)))))
+    ; Linear byte search from a byte offset: first-byte skip, block-
+    ; compare confirm.  Returns the BYTE index or nil.  Sound for
+    ; StrUtf8 inputs too: a valid UTF-8 needle can never match starting
+    ; mid-sequence, so a byte hit is always a code-point-aligned hit.
+    (method %find-bytes (self sub from s)
+      (def m (%str-byte-len sub))
+      (def n (%str-byte-len s))
+      (if (eq? m 0) (if (%sc-int< n from) () from)
+        (do
+          (def c0 (%char->integer (%str-byte-ref sub 0)))
+          (def last (%n2s-int- n m))
+          (def subp (%str->ptr sub))
+          (def sbase (%ptr->int (%str->ptr s)))
+          (let go ((i from))
+            (if (%sc-int< last i) ()
+              (if (eq? (%char->integer (%str-byte-ref s i)) c0)
+                (if (eq? 0 (%mem-cmp (%int->ptr (%sc-int+ sbase i)) subp m))
+                  i
+                  (go (%sc-int+ i 1)))
+                (go (%sc-int+ i 1))))))))
+    ; Backward twin of %find-bytes.
+    (method %rfind-bytes (self sub s)
+      (def m (%str-byte-len sub))
+      (def n (%str-byte-len s))
+      (if (eq? m 0) n
+        (do
+          (def c0 (%char->integer (%str-byte-ref sub 0)))
+          (def subp (%str->ptr sub))
+          (def sbase (%ptr->int (%str->ptr s)))
+          (let go ((i (%n2s-int- n m)))
+            (if (%sc-int< i 0) ()
+              (if (eq? (%char->integer (%str-byte-ref s i)) c0)
+                (if (eq? 0 (%mem-cmp (%int->ptr (%sc-int+ sbase i)) subp m))
+                  i
+                  (go (%n2s-int- i 1)))
+                (go (%n2s-int- i 1))))))))
 
     ; --- construction ---
     (method append (self . (param args STRING "Strings to concatenate"))
-      (doc "Concatenate all argument strings, left to right."
+      (doc "Concatenate all argument strings, left to right. Errors on a non-string argument; use (Str8 str ...) to render non-strings."
         (returns STRING "The arguments joined end to end")
         (example "(Str8 append \"ab\" \"cd\" \"ef\")" "\"abcdef\""))
-      (%fold %str-append "" args))
+      ; Same hazard join guards, and the same remedy: %str-append is a raw byte
+      ; concat, so a non-string ARGUMENT makes it read arbitrary memory -- nil
+      ; segfaulted here (#159) while every sibling seat already raised. The
+      ; per-argument check is noise next to the allocation each step pays.
+      ; Checks per argument as ever; the concatenation is one pass
+      ; (#333), not an accumulator re-copy per argument.
+      (%str-concat
+        (%map (fn (_ s) (%str8-check s "Str8 append: not a string")) args)))
     (method str (self . (param args ANY "Values to render and concatenate"))
       (doc "Concatenate values into one string, coercing each via display (so non-strings render too). The target of $\"...{expr}...\" interpolation."
         (returns STRING "The rendered values joined end to end")
@@ -7752,13 +9734,16 @@
       (doc "True if a sorts before b in element (byte) order."
         (returns BOOL "#t when a is lexicographically less than b")
         (example "(Str8 <? \"abc\" \"abd\")" "#t"))
-      (let go ((i 0) (la (self length a)) (lb (self length b)))
-        (cond
-          ((= i la) (< i lb))
-          ((= i lb) #f)
-          ((Char <? (self ref i a) (self ref i b)) #t)
-          ((Char >? (self ref i a) (self ref i b)) #f)
-          (#t (go (+ i 1) la lb)))))
+      ; One block compare of the common prefix, then a length tiebreak
+      ; (#332): byte order equals code-point order for UTF-8 (the note
+      ; above), and the old loop paid two dispatches per element.
+      (do (%str8-check a "Str8 <?: not a string")
+          (%str8-check b "Str8 <?: not a string")
+          (def la (%str-byte-len a))
+          (def lb (%str-byte-len b))
+          (def n (if (%sc-int< lb la) lb la))
+          (def c (%mem-cmp (%str->ptr a) (%str->ptr b) n))
+          (if (eq? c 0) (%sc-int< la lb) (eq? c -1))))
     (method >?  (self (param a STRING "First string") (param b STRING "Second string"))
       (doc "True if a sorts after b in element (byte) order."
         (returns BOOL "#t when a is lexicographically greater than b")
@@ -7816,16 +9801,30 @@
       (match
         ((null? lst) "")
         ((null? (rest lst)) (%str8-check (first lst) "Str8 join: element not a string"))
-        (#t (%fold (fn (_ acc s)
-                    (%str-append acc (%str-append sep (%str8-check s "Str8 join: element not a string"))))
-                  (%str8-check (first lst) "Str8 join: element not a string") (rest lst)))))
+        ; Interleave into a piece list, concatenate ONCE (#333): joining
+        ; n pieces of average length L was O(n^2 L) bytes copied.
+        (#t (%str-concat
+              (pair (%str8-check (first lst) "Str8 join: element not a string")
+                    (%fold (fn (_ acc s)
+                             (pair sep (pair (%str8-check s "Str8 join: element not a string") acc)))
+                           () (%reverse (rest lst))))))))
     (method repeat (self (param n INT "Number of copies") (param s STRING "String to repeat"))
       (doc "Concatenate n copies of s (empty string when n <= 0)."
         (returns STRING "s repeated n times")
         (example "(Str8 repeat 3 \"ab\")" "\"ababab\""))
       (def k (%str8->int n "Str8 repeat: count not convertible to INT"))
-      (def go (fn (self j) (if (<= j 0) "" (%str-append s (self (- j 1))))))
-      (go k))
+      ; Binary doubling (#333): ~2*log2(n) C appends instead of n.  The
+      ; old shape was O(n^2) bytes AND non-tail -- (Str8 repeat 10000
+      ; "a") overflowed the C stack outright (segfault, noted on the
+      ; issue); a flat n-piece concat fixed the crash but paid
+      ; interpreter overhead per piece (measured ~40us/piece), where
+      ; doubling pays it per BIT of n.
+      (def go (fn (self j base acc)
+        (if (<= j 0) acc
+          (self (>> j 1)
+                (%str-append base base)
+                (if (= 1 (& j 1)) (%str-append acc base) acc)))))
+      (if (<= k 0) "" (go k s "")))
 
     ; --- padding (to n ELEMENTS: bytes for Str8, code points for Str --
     ; NOT display columns; wcwidth-style column tables are a known gap) ---
@@ -7848,38 +9847,35 @@
         (%str-append s (self make (- k len) ch))))
 
     ; --- searching ---
-    (method contains? (self (param sub STRING "Substring to search for") (param s STRING "String to search in"))
+    (method includes? (self (param sub STRING "Substring to search for") (param s STRING "String to search in"))
       (doc "True if sub occurs anywhere within s (empty sub always matches)."
         (returns BOOL "#t when s contains sub")
-        (example "(Str8 contains? \"ll\" \"hello\")" "#t"))
-      (def s-len (self length s))
-      (def sub-len (self length sub))
-      (def go (fn (loop i)
-        (if (> (+ i sub-len) s-len) #f
-          (if (self match-at? sub i s) #t (loop (+ i 1))))))
-      (if (= sub-len 0) #t (go 0)))
+        (example "(Str8 includes? \"ll\" \"hello\")" "#t"))
+      ; Boolean of the linear byte scan (#332); byte-sound for StrUtf8
+      ; (see %find-bytes).  The old walk allocated a substring and ran
+      ; an interpreted compare per position.
+      (do (%str8-check sub "Str8 includes?: not a string")
+          (%str8-check s "Str8 includes?: not a string")
+          (not (null? (self %find-bytes sub 0 s)))))
     (method index-of (self (param sub STRING "Substring to search for") (param s STRING "String to search in"))
       (doc "The element position of sub's first occurrence in s, or nil on a miss (absence is nil, like every other index-search miss). An empty sub matches at 0."
         (returns ANY "Position, or nil")
         (example "(Str8 index-of \"ll\" \"hello\")" "2")
         (example "(null? (Str8 index-of \"zz\" \"hello\"))" "#t"))
-      (def s-len (self length s))
-      (def sub-len (self length sub))
-      (def go (fn (loop i)
-        (if (> (+ i sub-len) s-len) ()
-          (if (self match-at? sub i s) i (loop (+ i 1))))))
-      (go 0))
+      ; The linear byte scan directly: Str8 element positions ARE byte
+      ; positions.  StrUtf8 overrides to translate the byte hit to a
+      ; code-point index (#332).
+      (do (%str8-check sub "Str8 index-of: not a string")
+          (%str8-check s "Str8 index-of: not a string")
+          (self %find-bytes sub 0 s)))
     (method last-index-of (self (param sub STRING "Substring to search for") (param s STRING "String to search in"))
       (doc "The element position of sub's LAST occurrence in s, or nil on a miss. An empty sub matches at the end."
         (returns ANY "Position, or nil")
         (example "(Str8 last-index-of \"l\" \"hello\")" "3")
         (example "(null? (Str8 last-index-of \"zz\" \"hello\"))" "#t"))
-      (def s-len (self length s))
-      (def sub-len (self length sub))
-      (def go (fn (loop i)
-        (if (< i 0) ()
-          (if (self match-at? sub i s) i (loop (- i 1))))))
-      (go (- s-len sub-len)))
+      (do (%str8-check sub "Str8 last-index-of: not a string")
+          (%str8-check s "Str8 last-index-of: not a string")
+          (self %rfind-bytes sub s)))
     (method replace (self (param old STRING "Literal substring to replace (not a regex)")
                           (param replacement STRING "Replacement")
                           (param s STRING "String to rewrite"))
@@ -7891,14 +9887,19 @@
       (when (= (self length old) 0)
         (Err raise (lit value) "Str replace: empty search string" ()))
       (def old-len (self length old))
+      ; Segments prepend into a piece list, ONE concat at the end
+      ; (#333): the old accumulator re-copied all prior output per
+      ; match.  s-len is hoisted (it was recomputed twice per match);
+      ; the per-match tail substring the search still allocates is
+      ; #332's search-cost territory, not this issue's.
+      (def s-len (self length s))
       (def go (fn (loop from acc)
-        (let ((i (self index-of old (self sub from (- (self length s) from) s))))
+        (let ((i (self index-of old (self sub from (- s-len from) s))))
           (if (null? i)
-            (%str-append acc (self sub from (- (self length s) from) s))
+            (%str-concat (%reverse (pair (self sub from (- s-len from) s) acc)))
             (loop (+ from (+ i old-len))
-                  (%str-append acc
-                    (%str-append (self sub from i s) replacement)))))))
-      (go 0 ""))
+                  (pair replacement (pair (self sub from i s) acc)))))))
+      (go 0 ()))
     (method format (self (param spec STRING "Template: literal text with {} slots; {{ and }} escape braces")
                          . (param args ANY "One value per {} slot"))
       (doc "Render args into a template (#25). A slot is {} or {:FLAGS} with FLAGS = [<|>][WIDTH][.PRECISION]: < left-aligns (default), > right-aligns, WIDTH pads with spaces to at least WIDTH ELEMENTS (bytes for Str8, code points for Str), .P renders a number with exactly P decimals (floats round; ints gain .000...). Slot/argument counts must match (kind-'value otherwise). Strings render raw; other values render display-style."
@@ -7941,8 +9942,8 @@
               ; float path: the value existing means the tower is loaded
               (do
                 (def scale (let go ((p prec) (acc 1)) (if (= p 0) acc (go (- p 1) (* acc 10)))))
-                (def r (Float / (Float round (Float * v (Float exact->inexact scale)))
-                                (Float exact->inexact scale)))
+                (def r (Float / (Float round (Float * v (Float from scale)))
+                                (Float from scale)))
                 (def rs (%display-to-str r))
                 (if (= prec 0) (self sub 0 (self index-of "." rs) rs)
                   (let ((dot (self index-of "." rs)))
@@ -7997,14 +9998,18 @@
       (doc "True if s begins with the prefix pfx."
         (returns BOOL "#t when s starts with pfx")
         (example "(Str8 starts? \"he\" \"hello\")" "#t"))
-      (self match-at? pfx 0 s))
+      (self %match-bytes-at? pfx 0 s))
     (method ends?   (self (param sfx STRING "Suffix to test for") (param s STRING "String to check"))
       (doc "True if s ends with the suffix sfx."
         (returns BOOL "#t when s ends with sfx")
         (example "(Str8 ends? \"lo\" \"hello\")" "#t"))
-      (def s-len (self length s))
-      (def sfx-len (self length sfx))
-      (if (> sfx-len s-len) #f (self match-at? sfx (- s-len sfx-len) s)))
+      ; Byte lengths deliberately (#332): a byte-suffix match IS an
+      ; element-suffix match for valid UTF-8, so StrUtf8 inherits this
+      ; without paying its O(n) code-point length twice.
+      (def s-len (%str-byte-len s))
+      (def sfx-len (%str-byte-len sfx))
+      (if (%sc-int< s-len sfx-len) #f
+        (self %match-bytes-at? sfx (%n2s-int- s-len sfx-len) s)))
 
     ; --- transformation ---
     (method reverse  (self (param s STRING "String to reverse"))
@@ -8021,12 +10026,14 @@
       (doc "Uppercase the ASCII letters of s; other characters pass through."
         (returns STRING "s with a-z mapped to A-Z")
         (example "(Str8 upcase \"café\")" "\"CAFé\""))
-      (self ->str (%map (fn (_ c) (Char upcase c)) (self ->list s))))
+      (def %upf (method-of Char (lit upcase)))
+      (self ->str (%map (fn (_ c) (%upf Char c)) (self ->list s))))
     (method downcase (self (param s STRING "String to convert"))
       (doc "Lowercase the ASCII letters of s; other characters pass through."
         (returns STRING "s with A-Z mapped to a-z")
         (example "(Str8 downcase \"ABC\")" "\"abc\""))
-      (self ->str (%map (fn (_ c) (Char downcase c)) (self ->list s))))
+      (def %dnf (method-of Char (lit downcase)))
+      (self ->str (%map (fn (_ c) (%dnf Char c)) (self ->list s))))
 
     ; --- trimming (whitespace is ASCII; element scanning is correct) ---
     (method trim-left (self (param s STRING "String to trim"))
@@ -8054,42 +10061,77 @@
       (self trim-left (self trim-right s)))
 
     ; --- splitting (empty sep -> per element; else element search) ---
+    (method wrap (self (param width INT "Column limit, in bytes")
+                       (param s STRING "Text to wrap"))
+      (doc "Greedy word-wrap: split s on whitespace (spaces, tabs, newlines all break words) and pack words into lines at most width bytes long. A word longer than width stands alone on its own over-length line -- words are never broken (#375). Returns no empty lines; all-whitespace input gives ()."
+        (returns LIST "Lines, in order")
+        (example "(Str8 wrap 10 \"the quick brown fox\")" "(\"the quick\" \"brown fox\")"))
+      (def words
+        (List reject (fn (_ w) (str=? w ""))
+          (Str8 split " "
+            (Str8 replace "\t" " " (Str8 replace "\n" " " (Str8 replace "\r" " " s))))))
+      (let go ((ws words) (line "") (llen 0) (acc ()))
+        (match
+          ((null? ws) (if (= llen 0) (%reverse acc) (%reverse (pair line acc))))
+          (#t
+            (let ((w (first ws)))
+              (let ((wlen (Str8 length w)))
+                (match
+                  ((= llen 0) (go (rest ws) w wlen acc))
+                  ((<= (+ llen (+ 1 wlen)) width)
+                    (go (rest ws) (Str8 append line " " w) (+ llen (+ 1 wlen)) acc))
+                  (#t (go (rest ws) w wlen (pair line acc)))))))))) 
+
+    (method fill (self (param width INT "Column limit, in bytes")
+                       (param s STRING "Text to wrap"))
+      (doc "wrap, joined back with newlines: one string, lines at most width bytes (over-length single words excepted)."
+        (returns STRING "The wrapped text")
+        (example "(Str8 fill 10 \"the quick brown fox\")" "\"the quick\\nbrown fox\""))
+      (def lines (Str8 wrap width s))
+      (if (null? lines) ""
+        (List fold (fn (_ acc l) (Str8 append acc "\n" l)) (first lines) (rest lines))))
+
     (method split (self (param sep STRING "Separator to split on") (param s STRING "String to split"))
       (doc "Split s into a list of pieces around each occurrence of sep (empty sep splits into single elements)."
         (returns LIST "List of substrings of s between separators")
         (example "(Str8 split \",\" \"a,b,c\")" "(\"a\" \"b\" \"c\")"))
-      (def sep-len (self length sep))
-      (def s-len (self length s))
-      (if (= sep-len 0)
+      ; Byte scan + byte slices (#332): every cut lands on a match of
+      ; sep, which for valid UTF-8 is code-point aligned, so StrUtf8
+      ; inherits this byte implementation soundly.  The old walk paid a
+      ; substring allocation and an interpreted compare per position.
+      ; The empty-sep arm stays fully dispatched: per ELEMENT is the
+      ; contract (code points under StrUtf8).
+      (def sep-len (%str-byte-len sep))
+      (def s-len (%str-byte-len s))
+      (if (eq? sep-len 0)
         (%map (fn (_ c) (self ->str (list c))) (self ->list s))
-        (let go ((start 0) (i 0) (acc ()))
-          (if (> (+ i sep-len) s-len)
-            (%reverse (pair (self sub start (- s-len start) s) acc))
-            (if (self =? (self sub i sep-len s) sep)
-              (go (+ i sep-len) (+ i sep-len)
-                  (pair (self sub start (- i start) s) acc))
-              (go start (+ i 1) acc))))))))
+        (let go ((start 0) (acc ()))
+          (let ((hit (self %find-bytes sep start s)))
+            (if (null? hit)
+              (%reverse (pair (%str-byte-sub s start (%n2s-int- s-len start)) acc))
+              (go (%sc-int+ hit sep-len)
+                  (pair (%str-byte-sub s start (%n2s-int- hit start)) acc)))))))))
 
 (doc (provide x/protocol/str/str8 Str8)
   (note "The 8-bit byte view. Use (Str8 length s), (Str8 upcase s), etc.; (help Str8) lists every method, (help Str8 method) shows one.")
   "Str8: the 8-bit byte string protocol (a Seq subclass) with the full string method suite.")
 ; ---- end lib/x/protocol/str/str8.x ----
 ; ---- begin lib/x/protocol/str/utf8.x ----
-; str/utf8.x -- StrUTF8: the UTF-8 code-point string class
+; str/utf8.x -- StrUtf8: the UTF-8 code-point string class
 (import x/protocol/str/str8)
 ; Fetch the string prims from the catalog (ns `str` is de-registered, R5).
 (def %str-byte-sub (prim-ref (lit str) (lit byte-sub)))
 (def %str-byte-len (prim-ref (lit str) (lit byte-len)))
 
-(import x/codec/utf8)
+; (import x/codec/utf8) -- inlined above
 ; Fetch the char/int casts from the catalog (ns `char`/`int` utility members de-registered, R5).
 (def %char->integer (prim-ref (lit char) (lit ->int)))
 (def %integer->char (prim-ref (lit int) (lit ->char)))
 
 
-; StrUTF8 reinterprets the SAME bytes as Str8, but one whole UTF-8 sequence per
+; StrUtf8 reinterprets the SAME bytes as Str8, but one whole UTF-8 sequence per
 ; element, yielding the decoded code point as a CHARACTER. It inherits the full
-; string suite from Str8 (append, join, contains?, split, trim, =?, <?, ...) --
+; string suite from Str8 (append, join, includes?, split, trim, =?, <?, ...) --
 ; written once through self primitives -- and overrides ONLY the primitives that
 ; change with the encoding:
 ;   length      : code-point count (cursor walk), not Str8's O(1) byte length
@@ -8111,18 +10153,18 @@
         (self s (- k 1) (rest (%utf8-decode s from)))
         from))))
 
-(def-class StrUTF8 (extends Str8)
+(def-class StrUtf8 (extends Str8)
   (static
     (method length (self (param v STRING "String to measure"))
       (doc "Number of UTF-8 CODE POINTS in v (not bytes), via a cursor walk."
         (returns INT "Code-point count of v")
-        (example "(StrUTF8 length \"$¢€\")" "3"))
+        (example "(StrUtf8 length \"$¢€\")" "3"))
       (self count v))   ; code points, via Seq's cursor walk
 
     (method ref (self (param i INT "Code-point position (0-based; negative counts from the end)") (param v STRING "String to index"))
       (doc "The i-th CODE POINT of v as a CHARACTER, found by an O(n) UTF-8 walk; negative i counts from the end. Errors when i is nil or out of range."
         (returns CHAR "Code point at position i")
-        (example "(StrUTF8 ref 1 \"$¢€\")" "#\\¢"))
+        (example "(StrUtf8 ref 1 \"$¢€\")" "#\\¢"))
       ; The walker clamps at the byte length, so landing there means i is past
       ; the last code point -- error instead of decoding past the end. The nil
       ; guard makes a piped index-search miss fail loudly; only the negative
@@ -8139,10 +10181,10 @@
     (method sub (self (param start INT "Start code-point offset (0-based)") (param len INT "Number of code points") (param v STRING "Source string"))
       (doc "Substring of len CODE POINTS starting at code-point offset start (O(n) walk)."
         (returns STRING "The len-code-point slice of v from start")
-        (example "(StrUTF8 sub 1 1 \"$¢€\")" "\"¢\""))
+        (example "(StrUtf8 sub 1 1 \"$¢€\")" "\"¢\""))
       (def st2 (%str8->int start "Str sub: start not convertible to INT"))
       (def len2 (%str8->int len "Str sub: length not convertible to INT"))
-      ; StrUTF8 overrides sub, so Str8's guard does not cover this path
+      ; StrUtf8 overrides sub, so Str8's guard does not cover this path
       ; (%u8-byte-offset walks the raw bytes just the same). See #51.
       (%str8-check v "Str sub: not a string")
       (def b0 (%u8-byte-offset v st2 0))
@@ -8152,15 +10194,38 @@
     (method step (self (param cur INT "Current byte offset of the cursor") (param v STRING "String being traversed"))
       (doc "Cursor step: decode one UTF-8 sequence at byte offset cur, yielding (CODE-POINT . next-byte-offset)."
         (returns PAIR "Pair of the decoded code point (CHARACTER) and the next byte offset")
-        (example "(StrUTF8 step 1 \"$¢\")" "(#\\¢ . 3)"))
+        (example "(StrUtf8 step 1 \"$¢\")" "(#\\¢ . 3)"))
       (let ((d (%utf8-decode v cur)))
         (pair (%integer->char (first d)) (rest d))))
 
     ; encode: a code point -> its UTF-8 bytes (inverse of step)
+    ; --- search translations (#332): the byte doors inherited from
+    ; Str8 find BYTE offsets; these walkers convert to/from code-point
+    ; indices in one O(offset) pass, replacing the old inherited
+    ; searches that re-ran O(n) code-point length/sub per position.
+    (method %byte->cp (self bpos s)
+      (let go ((b 0) (i 0))
+        (if (>= b bpos) i
+          (go (+ b (self width s b)) (+ i 1)))))
+    (method %cp->byte (self k s)
+      (def n (%str-byte-len s))
+      (let go ((i 0) (b 0))
+        (if (>= i k) b
+          (if (>= b n) b
+            (go (+ i 1) (+ b (self width s b)))))))
+    (method match-at? (self sub pos s)
+      (self %match-bytes-at? sub (self %cp->byte pos s) s))
+    (method index-of (self sub s)
+      (let ((b (self %find-bytes sub 0 s)))
+        (if (null? b) () (self %byte->cp b s))))
+    (method last-index-of (self sub s)
+      (let ((b (self %rfind-bytes sub s)))
+        (if (null? b) () (self %byte->cp b s))))
+
     (method char->bytes (self (param el CHAR "Code point to encode"))
       (doc "Encode one CODE POINT to its 1-4 UTF-8 bytes (inverse of step)."
         (returns LIST "List of the UTF-8 byte values (integers) for el")
-        (example "(StrUTF8 char->bytes (Char from-int 162))" "(194 162)"))
+        (example "(StrUtf8 char->bytes (Char from-int 162))" "(194 162)"))
       (%utf8-encode (%char->integer el)))
 
     ; --- The byte <-> code-point codec (x/codec/utf8 surfaces here) ---
@@ -8175,7 +10240,7 @@
     (method encode (self (param cp INT "Code point to encode"))
       (doc "Encode a code point as a list of its 1-4 UTF-8 byte values. Out-of-range emits U+FFFD."
         (returns LIST "UTF-8 byte values (integers)")
-        (example "(StrUTF8 encode 162)" "(194 162)"))
+        (example "(StrUtf8 encode 162)" "(194 162)"))
       (%utf8-encode cp))
     (method width (self (param s STRING "Byte string") (param i INT "Byte index of a sequence start"))
       (doc "Byte width of the UTF-8 sequence at byte index i. Allocation-free."
@@ -8188,18 +10253,18 @@
 
 ; Str = the AMBIENT string protocol. The default is UTF-8 (code points): the
 ; bare string call (s i), the str-* API, and str->list all work in code points
-; out of the box. Str8 and StrUTF8 always name their fixed protocols; rebind
+; out of the box. Str8 and StrUtf8 always name their fixed protocols; rebind
 ; Str (e.g. (def Str Str8)) to change the active protocol for the whole str-*
 ; library at once.
-(def Str StrUTF8)
+(def Str StrUtf8)
 
 ; Value dispatch over the existing code-point call handler: ("hi" index 0) and
 ; ("hi" upcase) dispatch to Str methods; ("hi" 0) still does code-point access.
 (%bind-call-over! (Type of "x") Str)
 
-(doc (provide x/protocol/str/utf8 StrUTF8 Str)
-  (note "The UTF-8 code-point view (a Str8 subclass). Str is the blessed ambient alias -- it names the ACTIVE protocol (rebindable); Str8 and StrUTF8 are the canonical fixed names (A11: the Utf8 alias was retired). (help StrUTF8) lists every method.")
-  "StrUTF8: the UTF-8 code-point string protocol, overriding Str8's element access for code points.")
+(doc (provide x/protocol/str/utf8 StrUtf8 Str)
+  (note "The UTF-8 code-point view (a Str8 subclass). Str is the blessed ambient alias -- it names the ACTIVE protocol (rebindable); Str8 and StrUtf8 are the canonical fixed names (A11: the Utf8 alias was retired). (help StrUtf8) lists every method.")
+  "StrUtf8: the UTF-8 code-point string protocol, overriding Str8's element access for code points.")
 ; ---- end lib/x/protocol/str/utf8.x ----
 ; ---- begin lib/x/type/str.x ----
 ; str.x -- The string library entry point.
@@ -8207,21 +10272,21 @@
 ; The string API is the protocol CLASSES, not a set of str-* functions:
 ;
 ;   Str8     (x/protocol/str/str8)  -- the 8-bit byte protocol
-;   StrUTF8  (x/protocol/str/utf8)  -- the UTF-8 code-point protocol
-;   Str                            -- the ACTIVE protocol (StrUTF8 by default)
+;   StrUtf8  (x/protocol/str/utf8)  -- the UTF-8 code-point protocol
+;   Str                            -- the ACTIVE protocol (StrUtf8 by default)
 ;
 ; Use (Str append a b), (Str length s), (Str upcase s), (Str split sep s), ...
-; and (help Str8 <method>) / (help StrUTF8 <method>) for per-method docs.
+; and (help Str8 <method>) / (help StrUtf8 <method>) for per-method docs.
 ; To switch the active protocol for everything that goes through Str, rebind it:
 ; (def Str Str8) makes the bare string call and Str-based code byte-oriented.
 ;
-; Importing this module makes Str8 / StrUTF8 / Str available. (The classes are
+; Importing this module makes Str8 / StrUtf8 / Str available. (The classes are
 ; also preloaded at boot, so they are globally available without an import.)
 ;
 ; The deprecated str-* helper functions have been removed; use the byte
 ; accessors below and the class methods for the full API.
 
-(import x/protocol/str/utf8)   ; provides Str8, StrUTF8, and the Str alias
+(import x/protocol/str/utf8)   ; provides Str8, StrUtf8, and the Str alias
 
 ; --- Byte accessors (the raw 8-bit view) ---
 ; str-length / str-ref / substring are defined in boot (bound to the str-byte-*
@@ -8229,7 +10294,7 @@
 ; the low-level octet API the readers/tokenizers rely on. str=? is the byte-level
 ; equality primitive. Documented here for discoverability; for the active-protocol
 ; element view use the Str methods (e.g. (Str length s), (Str ref i s)) or the
-; explicit (Str8 ...) / (StrUTF8 ...).
+; explicit (Str8 ...) / (StrUtf8 ...).
 
 (doc str-length
   (param s STRING "String to measure")
@@ -8242,7 +10307,7 @@
   (param i INT "Byte offset (negative counts from the end)")
   (returns CHAR "The byte at offset i, as a CHARACTER (0-255)")
   (example "(%str-ref \"$¢€\" 1)" "#\\Â")
-  "Byte at offset i, UNCHECKED: an out-of-range offset reads out of bounds -- use (Str8 ref i s) for the checked byte view. For the i-th code point use (StrUTF8 ref i s) or the bare (s i) -- equivalent, including negative i counting from the end.")
+  "Byte at offset i, UNCHECKED: an out-of-range offset reads out of bounds -- use (Str8 ref i s) for the checked byte view. For the i-th code point use (StrUtf8 ref i s) or the bare (s i) -- equivalent, including negative i counting from the end.")
 
 (doc substring
   (param s STRING "Source string")
@@ -8259,14 +10324,18 @@
   "String equality (byte-level; the same result as code-point equality).")
 
 (doc (provide x/type/str)
-  (note "The string library is the protocol classes Str8 / StrUTF8, with Str naming the active protocol (StrUTF8 by default). Use (Str append a b), (Str length s), etc.; (help Str8 method) for per-method docs.")
+  (note "The string library is the protocol classes Str8 / StrUtf8, with Str naming the active protocol (StrUtf8 by default). Use (Str append a b), (Str length s), etc.; (help Str8 method) for per-method docs.")
   (note "Byte accessors str-length, str-ref, substring, str=? are always byte-level.")
-  "String library: the Str8 / StrUTF8 protocol classes and the byte accessors.")
+  "String library: the Str8 / StrUtf8 protocol classes and the byte accessors.")
 ; ---- end lib/x/type/str.x ----
 ; Iterator protocol: defines the Iter class + wires the iter slot on the
 ; sequence types (registered above) + consumers.
 ; ---- begin lib/x/type/iter.x ----
 ; iter.x -- Iterator protocol, as the Iter class.
+;
+; One of the three iteration tiers -- Seq defines encodings, Iter drives
+; sequences, Gen composes lazy pipelines; the full statement lives in
+; x/protocol/seq.x's header (#365).
 ;
 ; Build:   (Iter new seq)  or  (Iter make step state)
 ; Drive:   (Iter next it)      (Iter empty? it)      (Iter step it)
@@ -8318,28 +10387,53 @@
 
 (def-class Iter ()
   (static
-    (method make   (self step state) (%i-make step state))
-    (method next   (self it)         (%i-next it))
+    (method make (self (param step CALLABLE "Pure step: (step state) -> (value . next-state); a NIL next-state ends the iteration after that value, and a nil state must answer ()")
+                       (param state ANY "Initial state; nil marks an already-exhausted iterator"))
+      (doc "Build an iterator from a pure step function and its starting state -- the from-scratch constructor; (Iter new) is the from-a-sequence door. Exhaustion rides the STATE: the step signals the last element by returning a nil next-state (the list step below is the model)."
+        (returns ITER "A fresh iterator")
+        (example "(Iter ->list (Iter make (fn (_ st) (if (null? st) () (pair (first st) (rest st)))) (list 1 2 3)))" "(1 2 3)"))
+      (%i-make step state))
+    (method next (self (param it ITER "Iterator to advance"))
+      (doc "The next element, ADVANCING the iterator in place (the C driver writes the successor state back into the box); () once exhausted. (Iter step) is the functional sibling that leaves it untouched."
+        (returns ANY "The next element, or nil when exhausted"))
+      (%i-next it))
     (method step   (self it)
       (doc "Step ITERATOR functionally: (value . next-iterator) leaving it untouched, or () when exhausted -- the generator view of an iterator."
         (param it ITER "Iterator") (returns ANY "Pair of value and successor iterator, or nil"))
       (%i-step it))
-    (method empty? (self it)         (%i-empty? it))
+    (method empty? (self (param it ITER "Iterator to test"))
+      (doc "Is the iterator exhausted? True once next would return nil; the source is not advanced."
+        (returns BOOL "True when nothing remains"))
+      (%i-empty? it))
     (method iter? (self (param x ANY "Value to test"))
       (doc "Test whether a value is an iterator."
         (returns BOOL "True if x is an iterator"))
       (%type? x %iter))
     ; nil has no type for the prim to dispatch on, so shadow it to an empty
     ; iterator; everything else uses the prim's per-type slot dispatch.
-    (method new    (self x)
+    (method new (self (param x ANY "A sequence: list, vector, string, or def-class instance; nil gives an empty iterator"))
+      (doc "An iterator over a sequence, via the type's iter slot. Instances yield their members as (name . value) pairs; also available bare as `iter`."
+        (returns ITER "An iterator positioned at the first element")
+        (example "(Iter ->list (Iter new (list 1 2)))" "(1 2)"))
       (if (null? x) (%i-make %list-iter-step ()) (%i-new x)))
-    (method ->list (self it)
+    (method ->list (self (param it ITER "Iterator to drain"))
+      (doc "Drain the iterator into a list, in order; the iterator ends exhausted."
+        (returns LIST "Every remaining element")
+        (example "(Iter ->list (Iter new \"ab\"))" "(#\\a #\\b)"))
       (let drain ((it it))
         (if (%i-empty? it) () (let ((h (%i-next it))) (pair h (drain it))))))
-    (method for-each (self f it)
+    (method for-each (self (param f CALLABLE "One-argument fn, called per element for effect")
+                           (param it ITER "Iterator to drain"))
+      (doc "Drain the iterator applying f to each element for effect; returns nil."
+        (returns ANY "nil"))
       (let loop ((it it))
         (if (%i-empty? it) () (do (f (%i-next it)) (loop it)))))
-    (method fold   (self f acc it)
+    (method fold (self (param f CALLABLE "Two-argument fn: (f acc element) -> next acc")
+                       (param acc ANY "Initial accumulator")
+                       (param it ITER "Iterator to drain"))
+      (doc "Drain the iterator folding f over the elements, left to right."
+        (returns ANY "The final accumulator")
+        (example "(Iter fold + 0 (Iter new (list 1 2 3)))" "6"))
       (let loop ((acc acc) (it it))
         (if (%i-empty? it) acc (loop (f acc (%i-next it)) it))))))
 
@@ -8394,25 +10488,115 @@
 ; Base: execution-context objects via the Base class.
 ; ---- begin lib/x/type/base.x ----
 ; base.x -- Base: execution-context ("base") objects via the object system.
-; The base C prims are de-registered (no bare names); each static method below
-; hands its evaluated args to the matching prim, captured from the catalog.
+;
+; (Base make) answers a Base INSTANCE wrapping the raw C base object (the
+; `raw` member), so a base is interactive: (b eval ...), (b bind ...),
+; (b cell 'line).  Every static accepts either form -- raw-of unwraps --
+; so plumbing that holds raw bases (logo's entry doors, tool scratch
+; bases, the C prims' own returns) is untouched; the tokenizer seams
+; (Tok read-str, Xon's base walks) unwrap the same way.
+;
+; The base C prims are de-registered (no bare names); each method hands
+; its evaluated args to the matching prim, captured from the catalog.
+; Field reflection walks the layout contract (engine/tools/contract/base-paths.x)
+; through type/type.x's %layout-* helpers (that module loads earlier).
 
 (import x/type/class)
 
 (def-class Base ()
+  (doc "Execution-context / sandbox objects: each base is a whole, isolated interpreter -- its own environment, type registry, and reader state -- wrapped as a Base instance."
+    (note "CONTRACT: a fresh base is the bare C ISA -- no display/write, no reader macros, no catalog protocol. Reach in with parent closures or (b bind ...); see core/sandbox specs.")
+    (note "An instance renders as #<base:objs N>; the raw C base it wraps (the `raw` member) renders as the opaque #<obj:BASE>.")
+    (note "Field access walks the layout contract: (b cell 'line), names from (Base fields).")
+    (example "(let ((b (Base make))) (b eval '(+ 1 2)))" "3"))
+  (doc raw "The raw C base object this instance wraps -- what the C prims and tokenizer doors consume. Read it to hand the base to raw plumbing; (Base wrap r) re-clothes one.")
+  (method eval (self (param expr ANY "The form to evaluate (quote it -- it is a value here)"))
+    (doc "Evaluate expr inside this base, isolated from the outer env. An error raised inside propagates to the caller's guard; the base's env is restored to its pre-eval shape on the way out."
+      (returns ANY "The result of the evaluation")
+      (example "(let ((b (Base make))) (b eval '(+ 1 2)))" "3"))
+    ((prim-ref (lit base) (lit eval)) (self raw) expr))
+  (method bind (self (param name SYMBOL "The name to define")
+                     (param val ANY "The value to bind"))
+    (doc "Define name as val in this base's environment, visible to subsequent evals -- the door for handing a child selected capabilities."
+      (returns ANY "val")
+      (example "(let ((b (Base make))) (b bind 'x 5) (b eval 'x))" "5"))
+    ((prim-ref (lit base) (lit bind)) (self raw) name val))
+  (method make-type (self (param name STRING "The new type's name")
+                          (param h LIST "Handler alist: (verb . handler) pairs, e.g. 'write"))
+    (doc "Register a custom type on this base -- cross-base make-type. Handler closures are built in the CALLING base and travel with instances; this base is marked shared so the caller's GC never sweeps them."
+      (returns ANY "The type handle, for use inside this base"))
+    ((prim-ref (lit base) (lit make-type)) (self raw) name h))
+  (method cell (self (param fname SYMBOL "A base field name -- see (Base fields)"))
+    (doc "The object the layout contract's path addresses for fname, walked from this base. A cell-kind field's value sits in the cell's first slot; refuses non-base-rooted names."
+      (returns ANY "The addressed cell/object")
+      (example "(let ((b (Base make))) (%cell-int (first (b cell 'line))))" "1"))
+    (Type %layout-cell (self raw) fname (lit base)))
+  (method fields (self)
+    (doc "Every base field name from the layout contract."
+      (returns LIST "Field name symbols, contract order"))
+    (Type %layout-fields (lit base)))
+  (method %repr (self)
+    (doc "Inspection form: #<base:objs N> (N = the base's live allocation count)."
+      (returns STRING "The repr string"))
+    (Str8 append "#<base:objs "
+      (Str8 append (%number->str (%cell-int (first (self cell (lit alloc-count))))) ">")))
   (static
-    (method make      (self)                 ((prim-ref (lit base) (lit make))))
-    (method eval      (self target expr)     ((prim-ref (lit base) (lit eval)) target expr))
-    (method bind      (self target name val) ((prim-ref (lit base) (lit bind)) target name val))
-    (method make-type (self target name h)   ((prim-ref (lit base) (lit make-type)) target name h))
-    (method make-tok  (self)                 ((prim-ref (lit base) (lit make-tok))))))
+    (method make (self)
+      (doc "Create a fully initialized, isolated interpreter base, wrapped as a Base instance: the built-in types, the C prims, and a read buffer -- no lib is loaded."
+        (returns OBJECT "A Base instance; its raw member is the C base object")
+        (example "(let ((b (Base make))) (b eval '(* 6 7)))" "42"))
+      (let ((raw ((prim-ref (lit base) (lit make))))) (new Base raw raw)))
+    (method make-tok (self)
+      (doc "Create a minimal tokenizer base, wrapped as a Base instance: no types, no prims -- only the boolean singletons are inherited. For custom tokenizer type registration on an isolated base."
+        (returns OBJECT "A Base instance"))
+      (let ((raw ((prim-ref (lit base) (lit make-tok))))) (new Base raw raw)))
+    (method wrap (self (param r ANY "A raw base object (from the C prims or plumbing)"))
+      (doc "Clothe a raw base object as a Base instance." (returns OBJECT "The instance"))
+      (let ((raw r)) (new Base raw raw)))
+    (method base? (self (param v ANY "Any value"))
+      (doc "Test whether v is a Base instance."
+        (returns BOOL "#t for Base instances only")
+        (example "(Base base? 5)" "#f"))
+      (if (object? v) (eq? (class-of v) Base) #f))
+    (method raw-of (self (param v ANY "A Base instance or raw base"))
+      (doc "The raw base object of either form -- instances unwrap, anything else passes through. The seam the statics and tokenizer doors use."
+        (returns ANY "The raw base object"))
+      (if (Base base? v) (v raw) v))
+    (method eval (self (param target ANY "The base to evaluate in (instance or raw)")
+                       (param expr ANY "The form to evaluate (quote it -- it is a value here)"))
+      (doc "Evaluate expr inside target, isolated from the outer env. An error raised in target propagates to the caller's guard; target's env is restored to its pre-eval shape on the way out."
+        (returns ANY "The result of evaluating expr in target")
+        (example "(let ((b (Base make))) (Base eval b '(+ 1 2)))" "3"))
+      ((prim-ref (lit base) (lit eval)) (Base raw-of target) expr))
+    (method bind (self (param target ANY "The base to bind in (instance or raw)")
+                       (param name SYMBOL "The name to define")
+                       (param val ANY "The value to bind"))
+      (doc "Define name as val in target's environment, visible to subsequent (Base eval target ...) forms."
+        (returns ANY "val")
+        (example "(let ((b (Base make))) (Base bind b 'x 5) (Base eval b 'x))" "5"))
+      ((prim-ref (lit base) (lit bind)) (Base raw-of target) name val))
+    (method make-type (self (param target ANY "The base to register the type on (instance or raw)")
+                            (param name STRING "The new type's name")
+                            (param h LIST "Handler alist: (verb . handler) pairs, e.g. 'write"))
+      (doc "Register a custom type on target -- cross-base make-type. Handler closures are built in the CALLING base and travel with instances; target is marked shared so the caller's GC never sweeps them."
+        (returns ANY "The type handle, for use inside target")
+        (sample "(Base make-type b \"POINT\" (list (pair 'write (fn (_ o) (display \"<point>\")))))" "the POINT type handle"))
+      ((prim-ref (lit base) (lit make-type)) (Base raw-of target) name h))
+    (method cell (self (param target ANY "The base to walk (instance or raw)")
+                       (param fname SYMBOL "A base field name -- see (Base fields)"))
+      (doc "The layout-contract cell for fname, walked from target. Refuses non-base-rooted names."
+        (returns ANY "The addressed cell/object"))
+      (Type %layout-cell (Base raw-of target) fname (lit base)))
+    (method fields (self)
+      (doc "Every base field name in the layout contract (base-rooted rows of engine/tools/contract/base-paths.x)."
+        (returns LIST "Field name symbols, contract order"))
+      (Type %layout-fields (lit base)))))
 
 (doc (provide x/type/base Base)
-  (note "(Base make) -> a fresh execution-context (base) object.")
-  (note "CONTRACT: a fresh base is the bare C ISA -- no display/write, no catalog protocol. Reach in with parent closures or (Base bind); see core/sandbox specs.")
-  (note "(Base eval target expr) evaluates expr inside target, isolated from the outer env.")
-  (note "(Base bind target name val); (Base make-type target name handlers); (Base make-tok).")
-  (example "(let ((b (Base make))) (Base eval b '(+ 1 2)))" "3")
+  (note "(Base make) -> a Base instance wrapping a fresh execution-context; (b eval expr) / (Base eval b expr) evaluates expr inside it, isolated from the outer env.")
+  (note "CONTRACT: a fresh base is the bare C ISA -- no display/write, no catalog protocol. Reach in with parent closures or (b bind ...); see core/sandbox specs.")
+  (note "Field reflection: (b cell 'line) walks the layout contract; (Base fields) lists the names. The raw C base rides the `raw` member; statics and tokenizer seams accept either form.")
+  (example "(let ((b (Base make))) (b eval '(+ 1 2)))" "3")
   "Base: execution-context / sandbox objects, via the Base class.")
 ; ---- end lib/x/type/base.x ----
 ; List: list/sequence operations as the List class (core/list.x holds the
@@ -8484,14 +10668,16 @@
       (let ((lst (List from-seq lst))) (List fold f (first lst) (rest lst))))
     (method scan (self f init lst)
       (doc "Like fold, but returns a list of all intermediate values." (param f CALLABLE "Binary function") (param init ANY "Initial accumulator value") (param lst LIST "List or iterable"))
-      (let ((lst (List from-seq lst)))
-        (if (null? lst) (list init)
-          (pair init (recur self f (f init (first lst)) (rest lst))))))
+      (def go (fn (self xs a acc)
+        (if (null? xs) (%reverse (pair a acc))
+          (self (rest xs) (f a (first xs)) (pair a acc)))))
+      (go (List from-seq lst) init ()))
     (method fold-right (self f init lst)
       (doc "Fold from the right: elements combine last-to-first, callback (f acc element) like fold." (param f CALLABLE "Binary function: (accumulator, element) -> new accumulator") (param init ANY "Initial accumulator value") (param lst LIST "List or iterable") (returns ANY "Final accumulated value") (example "(List fold-right (fn (_ acc x) (pair x acc)) () (list 1 2 3))" "(1 2 3)"))
-      (let ((lst (List from-seq lst)))
-        (if (null? lst) init
-          (f (recur self f init (rest lst)) (first lst)))))
+      ; Right fold = left fold over the reversal; iterative (#336).
+      (def go (fn (self xs a)
+        (if (null? xs) a (self (rest xs) (f a (first xs))))))
+      (go (%reverse (List from-seq lst)) init))
     ; --- Basics ---
     (method length (self lst)
       (doc "Return the number of elements." (param lst LIST "List or iterable"))
@@ -8516,9 +10702,17 @@
     (method last (self lst)
       (doc "Return the last element of a list." (param lst LIST "Non-empty list"))
       (if (null? (rest lst)) (first lst) (recur self (rest lst))))
+    ; The rest of the #336 family (#300 caught the stragglers): every
+    ; (pair x (recur ...)) walk below was NON-TAIL -- C-stack depth =
+    ; list length, a segfault at ~10^4 elements (List range 10000 died
+    ; in the stress lane).  All converted to accumulate-and-reverse or
+    ; prefix-splice go loops; helpers defined BEFORE their users.
     (method init (self lst)
       (doc "Return all elements except the last." (param lst LIST "Non-empty list"))
-      (if (null? (rest lst)) () (pair (first lst) (recur self (rest lst)))))
+      (def go (fn (self xs acc)
+        (if (null? (rest xs)) (%reverse acc)
+          (self (rest xs) (pair (first xs) acc)))))
+      (go lst ()))
     (method append (self . args)
       (doc "Concatenate zero or more lists.")
       (List fold %append2 () args))
@@ -8530,51 +10724,73 @@
       (List fold (fn (_ acc x) (pair x acc)) () lst))
     (method flatten (self lst)
       (doc "Recursively flatten nested lists into a single list." (param lst LIST "Nested list"))
-      (match
-        ((null? lst) ())
-        ((pair? (first lst)) (%append2 (recur self (first lst)) (recur self (rest lst))))
-        (#t (pair (first lst) (recur self (rest lst))))))
+      ; Reverse-flatten onto acc: spine calls are tail; only structural
+      ; NESTING recurses (depth = nesting, not length).
+      (def go (fn (self x acc)
+        (match
+          ((null? x) acc)
+          ((pair? (first x)) (self (rest x) (self (first x) acc)))
+          (#t (self (rest x) (pair (first x) acc))))))
+      (%reverse (go lst ())))
     ; --- Iteration ---
     (method map (self f . lsts)
       (doc "Apply a function to each element. Supports multiple lists." (param f CALLABLE "Function to apply") (param lsts LIST "One or more lists") (returns LIST "New list"))
       (let ((lsts (%map1 (fn (_ x) (List from-seq x)) lsts)))
         (if (null? (rest lsts))
           (%map1 f (first lsts))
-          (if (%any-null? lsts) ()
-            (pair (apply f (%map1 first lsts)) (apply recur self f (%map1 rest lsts)))))))
+          ((fn (self ls acc)
+             (if (%any-null? ls) (%reverse acc)
+               (self (%map1 rest ls) (pair (apply f (%map1 first ls)) acc))))
+           lsts ()))))
+    ; Inner go loops (#336), the fold precedent: `recur` re-entered the
+    ; method and re-ran the from-seq normalization dispatch on EVERY
+    ; tail; the accumulate-and-reverse shape also makes the walks
+    ; iterative -- the old (pair x (recur ...)) bodies were non-tail
+    ; and overflowed the C stack on ~10^5-element lists (the repeat
+    ; segfault family, #333).
     (method filter (self pred lst)
       (doc "Return elements that satisfy a predicate." (param pred CALLABLE "Predicate function") (param lst LIST "List or iterable") (returns LIST "Filtered list"))
-      (let ((lst (List from-seq lst)))
+      (def go (fn (self xs acc)
         (match
-          ((null? lst) ())
-          ((pred (first lst)) (pair (first lst) (recur self pred (rest lst))))
-          (#t (recur self pred (rest lst))))))
+          ((null? xs) (%reverse acc))
+          ((pred (first xs)) (self (rest xs) (pair (first xs) acc)))
+          (#t (self (rest xs) acc)))))
+      (go (List from-seq lst) ()))
     (method for-each (self f . lsts)
       (doc "Apply a function to each element for side effects." (param f CALLABLE "Function to apply") (param lsts LIST "One or more lists"))
       (let ((lsts (%map1 (fn (_ x) (List from-seq x)) lsts)))
         (if (null? (rest lsts))
           (%for-each1 f (first lsts))
-          (if (not (%any-null? lsts))
-            (do (apply f (%map1 first lsts)) (apply recur self f (%map1 rest lsts)))))))
+          ((fn (self ls)
+             (if (%any-null? ls) ()
+               (do (apply f (%map1 first ls)) (self (%map1 rest ls)))))
+           lsts))))
     (method flat-map (self f lst)
       (doc "Map then flatten one level." (param f CALLABLE "Function returning a list") (param lst LIST "List or iterable"))
-      (let ((lst (List from-seq lst)))
-        (if (null? lst) () (%append2 (f (first lst)) (recur self f (rest lst))))))
+      ; Helper first: a closure only sees sibling defs made BEFORE it.
+      (def %rev-onto (fn (self l acc)
+        (match ((null? l) acc) (#t (self (rest l) (pair (first l) acc))))))
+      (def go (fn (self xs acc)
+        (if (null? xs) (%reverse acc)
+          (self (rest xs) (%rev-onto (f (first xs)) acc)))))
+      (go (List from-seq lst) ()))
     ; --- Predicates ---
     (method any? (self pred lst)
       (doc "Return #t if any element satisfies the predicate." (param pred CALLABLE "Predicate function") (param lst LIST "List or iterable"))
-      (let ((lst (List from-seq lst)))
+      (def go (fn (self xs)
         (match
-          ((null? lst) #f)
-          ((pred (first lst)) #t)
-          (#t (recur self pred (rest lst))))))
+          ((null? xs) #f)
+          ((pred (first xs)) #t)
+          (#t (self (rest xs))))))
+      (go (List from-seq lst)))
     (method all? (self pred lst)
       (doc "Return #t if all elements satisfy the predicate." (param pred CALLABLE "Predicate function") (param lst LIST "List or iterable"))
-      (let ((lst (List from-seq lst)))
+      (def go (fn (self xs)
         (match
-          ((null? lst) #t)
-          ((not (pred (first lst))) #f)
-          (#t (recur self pred (rest lst))))))
+          ((null? xs) #t)
+          ((not (pred (first xs))) #f)
+          (#t (self (rest xs))))))
+      (go (List from-seq lst)))
     (method none? (self pred lst)
       (doc "Return #t if no element satisfies the predicate." (param pred CALLABLE "Predicate function") (param lst LIST "List or iterable"))
       (not (List any? pred lst)))
@@ -8605,11 +10821,12 @@
     ; --- Search ---
     (method find (self pred lst)
       (doc "Return the first element satisfying a predicate, or nil." (param pred CALLABLE "Predicate function") (param lst LIST "List or iterable"))
-      (let ((lst (List from-seq lst)))
+      (def go (fn (self xs)
         (match
-          ((null? lst) ())
-          ((pred (first lst)) (first lst))
-          (#t (recur self pred (rest lst))))))
+          ((null? xs) ())
+          ((pred (first xs)) (first xs))
+          (#t (self (rest xs))))))
+      (go (List from-seq lst)))
     (method find-index (self pred lst)
       (doc "Return the index of the first element satisfying a predicate." (param pred CALLABLE "Predicate function") (param lst LIST "List or iterable") (returns ANY "Zero-based index, or nil if not found"))
       (let ((lst (List from-seq lst)))
@@ -8625,11 +10842,12 @@
       (List find-index (fn (_ el) (equal? el x)) lst))
     (method includes? (self x lst)
       (doc "Test if a list contains a value." (param x ANY "Value to search for") (param lst LIST "List or iterable") (returns BOOL "t if found"))
-      (let ((lst (List from-seq lst)))
+      (def go (fn (self xs)
         (match
-          ((null? lst) #f)
-          ((equal? x (first lst)) #t)
-          (#t (recur self x (rest lst))))))
+          ((null? xs) #f)
+          ((equal? x (first xs)) #t)
+          (#t (self (rest xs))))))
+      (go (List from-seq lst)))
     (method count-if (self pred lst)
       (doc "Count elements satisfying a predicate." (param pred CALLABLE "Predicate function") (param lst LIST "List or iterable") (returns INT "Count of matching elements"))
       (List fold (fn (_ acc x) (if (pred x) (+ acc 1) acc)) 0 lst))
@@ -8637,27 +10855,31 @@
     (method take (self n lst)
       (doc "Take the first n elements of a list (n coerced to INT)." (param n INT "Number of elements") (param lst LIST "List"))
       (def k (%list->int n "List take: count not convertible to INT"))
-      (def go (fn (self j xs)
-        (if (or (<= j 0) (null? xs)) ()
-          (pair (first xs) (self (- j 1) (rest xs))))))
-      (go k lst))
+      (def go (fn (self j xs acc)
+        ; Nested if, NOT and/or (#343): per element, operatives
+        ; expand per evaluation.
+        (if (if (<= j 0) #t (null? xs)) (%reverse acc)
+          (self (- j 1) (rest xs) (pair (first xs) acc)))))
+      (go k lst ()))
     (method chunk (self n lst)
       (doc "Split a list into successive n-element sublists; the last may be shorter." (param n INT "Chunk size (must be > 0)") (param lst LIST "List") (returns LIST "List of chunks") (example "(List chunk 2 (list 1 2 3 4 5))" "((1 2) (3 4) (5))"))
       (def k (%list->int n "List chunk: size not convertible to INT"))
-      (def go (fn (self xs)
-        (if (null? xs) ()
-          (pair (List take k xs) (self (List drop k xs))))))
-      (if (<= k 0) (Err raise (lit value) "List chunk: size must be positive" ()) (go lst)))
+      (def go (fn (self xs acc)
+        (if (null? xs) (%reverse acc)
+          (self (List drop k xs) (pair (List take k xs) acc)))))
+      (if (<= k 0) (Err raise (lit value) "List chunk: size must be positive" ()) (go lst ())))
     (method drop (self n lst)
       (doc "Drop the first n elements of a list (n coerced to INT)." (param n INT "Number of elements to skip") (param lst LIST "List"))
       (def k (%list->int n "List drop: count not convertible to INT"))
       (def go (fn (self j xs)
-        (if (or (<= j 0) (null? xs)) xs (self (- j 1) (rest xs)))))
+        (if (if (<= j 0) #t (null? xs)) xs (self (- j 1) (rest xs)))))
       (go k lst))
     (method take-while (self pred lst)
       (doc "Take elements from the front while predicate holds." (param pred CALLABLE "Predicate function") (param lst LIST "List"))
-      (if (or (null? lst) (not (pred (first lst)))) ()
-        (pair (first lst) (recur self pred (rest lst)))))
+      (def go (fn (self xs acc)
+        (if (if (null? xs) #t (not (pred (first xs)))) (%reverse acc)
+          (self (rest xs) (pair (first xs) acc)))))
+      (go lst ()))
     (method drop-while (self pred lst)
       (doc "Drop elements from the front while predicate holds." (param pred CALLABLE "Predicate function") (param lst LIST "List"))
       (match
@@ -8678,44 +10900,55 @@
       (doc "Generate a list of integers from start to end (both coerced to INT)." (param start INT "Start value (inclusive)") (param end INT "End value (exclusive)") (returns LIST "List of integers") (example "(List range 0 5)" "(0 1 2 3 4)"))
       (def a (%list->int start "List range: start not convertible to INT"))
       (def b (%list->int end "List range: end not convertible to INT"))
-      (def go (fn (self i) (if (>= i b) () (pair i (self (+ i 1))))))
-      (go a))
+      (def go (fn (self i acc)
+        (if (>= i b) (%reverse acc) (self (+ i 1) (pair i acc)))))
+      (go a ()))
     (method repeat (self n x)
       (doc "Create a list of n copies of a value (n coerced to INT); count first, matching (Str8 repeat n s)." (param n INT "Number of repetitions") (param x ANY "Value to repeat") (returns LIST "List of repeated values"))
       (def k (%list->int n "List repeat: count not convertible to INT"))
-      (def go (fn (self j)
-        (if (<= j 0) () (pair x (self (- j 1))))))
-      (go k))
+      (def go (fn (self j acc)
+        (if (<= j 0) acc (self (- j 1) (pair x acc)))))
+      (go k ()))
     (method times (self n f)
       (doc "Apply a function to each index 0..n-1, collecting results (n coerced to INT). Count first, per the constructor-count rule (was (f n) before the V6 adjudication)." (param n INT "Number of iterations") (param f CALLABLE "Function: index -> value") (returns LIST "List of results"))
       (def k (%list->int n "List times: count not convertible to INT"))
-      (def go (fn (self i) (if (>= i k) () (pair (f i) (self (+ i 1))))))
-      (go 0))
+      (def go (fn (self i acc)
+        (if (>= i k) (%reverse acc) (self (+ i 1) (pair (f i) acc)))))
+      (go 0 ()))
     (method unfold (self pred f g seed)
       (doc "Build a list by repeatedly applying step and value functions to a seed." (param pred CALLABLE "Stop predicate: seed -> boolean") (param f CALLABLE "Value function: seed -> element") (param g CALLABLE "Step function: seed -> next-seed") (param seed ANY "Initial seed value") (returns LIST "Generated list"))
-      (if (pred seed) () (pair (f seed) (recur self pred f g (g seed)))))
+      (def go (fn (self seed acc)
+        (if (pred seed) (%reverse acc)
+          (self (g seed) (pair (f seed) acc)))))
+      (go seed ()))
     (method iterate (self f n x)
       (doc "Generate n values by repeatedly applying f (n coerced to INT)." (param f CALLABLE "Step function") (param n INT "Number of iterations") (param x ANY "Initial value") (returns LIST "List of iterated values"))
       (def k (%list->int n "List iterate: count not convertible to INT"))
-      (def go (fn (self j v)
-        (if (<= j 0) () (pair v (self (- j 1) (f v))))))
-      (go k x))
+      (def go (fn (self j v acc)
+        (if (<= j 0) (%reverse acc) (self (- j 1) (f v) (pair v acc)))))
+      (go k x ()))
     (method zip (self a b)
       (doc "Pair up corresponding elements from two lists as assocs -- the result is an alist, so it feeds Dict from-alist and the Assoc API directly." (param a LIST "First elements (keys)") (param b LIST "Second elements (values)") (returns LIST "Alist of (a . b) assocs") (example "(List zip (list 1 2) (list 7 8))" "((1 . 7) (2 . 8))"))
-      (if (or (null? a) (null? b)) ()
-        (pair (pair (first a) (first b)) (recur self (rest a) (rest b)))))
+      (def go (fn (self a b acc)
+        (if (if (null? a) #t (null? b)) (%reverse acc)
+          (self (rest a) (rest b) (pair (pair (first a) (first b)) acc)))))
+      (go a b ()))
     (method zip-with (self f a b)
       (doc "Combine corresponding elements from two lists using a function." (param f CALLABLE "Combining function") (param a LIST "First list") (param b LIST "Second list") (returns LIST "Combined list"))
-      (if (or (null? a) (null? b)) ()
-        (pair (f (first a) (first b)) (recur self f (rest a) (rest b)))))
+      (def go (fn (self a b acc)
+        (if (if (null? a) #t (null? b)) (%reverse acc)
+          (self (rest a) (rest b) (pair (f (first a) (first b)) acc)))))
+      (go a b ()))
     (method unzip (self alist)
       (doc "Invert zip: an alist of (a . b) assocs becomes a list of two lists." (param alist LIST "Alist of (a . b) assocs") (returns LIST "(firsts seconds)") (example "(List unzip (List zip (list 1 2) (list \"a\" \"b\")))" "((1 2) (\"a\" \"b\"))"))
       (list (List map first alist)
             (List map rest alist)))
     (method interleave (self a b)
       (doc "Alternate elements from two lists, stopping at the shorter." (param a LIST "First list") (param b LIST "Second list") (returns LIST "(a1 b1 a2 b2 ...)") (example "(List interleave (list 1 3) (list 2 4))" "(1 2 3 4)"))
-      (if (or (null? a) (null? b)) ()
-        (pair (first a) (pair (first b) (recur self (rest a) (rest b))))))
+      (def go (fn (self a b acc)
+        (if (if (null? a) #t (null? b)) (%reverse acc)
+          (self (rest a) (rest b) (pair (first b) (pair (first a) acc))))))
+      (go a b ()))
     ; --- Transformation ---
     (method partition (self pred lst)
       (doc "Split a list into elements that match and don't match a predicate." (param pred CALLABLE "Predicate function") (param lst LIST "List"))
@@ -8731,12 +10964,17 @@
       ; Prepend into each group (O(1)) and reverse once at the end -- the old
       ; per-element (List append group (list val)) was O(n^2) on skewed keys.
       (def add-to-group
-        (fn (self alist key val)
-          (match
-            ((null? alist) (list (pair key (list val))))
-            ((eq? (first (first alist)) key)
-              (pair (pair key (pair val (rest (first alist)))) (rest alist)))
-            (#t (pair (first alist) (self (rest alist) key val))))))
+        (fn (_ alist key val)
+          (def %rev-onto (fn (self l tail)
+            (match ((null? l) tail) (#t (self (rest l) (pair (first l) tail))))))
+          (def go (fn (self pre xs)
+            (match
+              ((null? xs) (%rev-onto pre (list (pair key (list val)))))
+              ((eq? (first (first xs)) key)
+                (%rev-onto pre
+                  (pair (pair key (pair val (rest (first xs)))) (rest xs))))
+              (#t (self (pair (first xs) pre) (rest xs))))))
+          (go () alist)))
       (List map (fn (_ g) (pair (first g) (%reverse (rest g))))
         (List fold (fn (_ acc x) (add-to-group acc (f x) x)) () lst)))
     (method sort (self cmp lst)
@@ -8746,17 +10984,31 @@
         ; half in order (the old alternate-cons split reversed and interleaved
         ; the halves), and (b) merge takes from the LEFT half unless the right
         ; element comes strictly first, so ties keep input order.
+        ; Helpers first: a closure only sees sibling defs made BEFORE it.
+        (def %rev-onto2 (fn (self l tail)
+          (match ((null? l) tail) (#t (self (rest l) (pair (first l) tail))))))
+        (def %split (fn (self slow fast acc)
+          (match
+            ((null? fast) (pair (%reverse acc) slow))
+            ((null? (rest fast)) (pair (%reverse acc) slow))
+            (#t (self (rest slow) (rest (rest fast)) (pair (first slow) acc))))))
         (def merge
-          (fn (self a b)
-            (match
-              ((null? a) b)
-              ((null? b) a)
-              ((cmp (first b) (first a)) (pair (first b) (self a (rest b))))
-              (#t (pair (first a) (self (rest a) b))))))
-        (if (or (null? lst) (null? (rest lst))) lst
-          (let ((half (>> (List length lst) 1)))
-            (merge (recur self cmp (List take half lst))
-                   (recur self cmp (List drop half lst)))))))
+          ; Iterative merge (#336): the recursive body was non-tail
+          ; (stack depth = output length) and the old split paid
+          ; length/take/drop dispatches -- ~4 extra O(n) passes per
+          ; level.  The split walks once, tortoise-and-hare.
+          (fn (_ a b)
+            (def go (fn (self a b acc)
+              (match
+                ((null? a) (%rev-onto2 acc b))
+                ((null? b) (%rev-onto2 acc a))
+                ((cmp (first b) (first a)) (self a (rest b) (pair (first b) acc)))
+                (#t (self (rest a) b (pair (first a) acc))))))
+            (go a b ())))
+        (if (if (null? lst) #t (null? (rest lst))) lst
+          (let ((halves (%split lst lst ())))
+            (merge (recur self cmp (first halves))
+                   (recur self cmp (rest halves)))))))
     (method sort-by (self f lst)
       (doc "Sort by a key function (ascending)." (param f CALLABLE "Key function: element -> comparable value") (param lst LIST "List"))
       (List sort (fn (_ a b) (< (f a) (f b))) lst))
@@ -8770,11 +11022,13 @@
           (#t (go (rest xs) (pair (first xs) seen) (pair (first xs) acc))))))
     (method uniq (self lst)
       (doc "Remove consecutive duplicates from a sorted list." (param lst LIST "Sorted list"))
-      (match
-        ((null? lst) ())
-        ((null? (rest lst)) lst)
-        ((equal? (first lst) (first (rest lst))) (recur self (rest lst)))
-        (#t (pair (first lst) (recur self (rest lst))))))
+      (def go (fn (self xs acc)
+        (match
+          ((null? xs) (%reverse acc))
+          ((null? (rest xs)) (%reverse (pair (first xs) acc)))
+          ((equal? (first xs) (first (rest xs))) (self (rest xs) acc))
+          (#t (self (rest xs) (pair (first xs) acc))))))
+      (go lst ()))
     (method uniq-by (self f lst)
       (doc "Remove consecutive duplicates by key function." (param f CALLABLE "Key function") (param lst LIST "Sorted list"))
       (match
@@ -8784,77 +11038,82 @@
         ; keeps the earliest element of each run (Unix uniq's reading, and the
         ; one the docs always claimed). Recurring on (rest lst) kept the LAST
         ; instead -- #73.
-        ((equal? (f (first lst)) (f (first (rest lst))))
-         (recur self f (pair (first lst) (rest (rest lst)))))
-        (#t (pair (first lst) (recur self f (rest lst))))))
+        (#t
+          ((fn (self xs acc)
+             (match
+               ((null? xs) (%reverse acc))
+               ((null? (rest xs)) (%reverse (pair (first xs) acc)))
+               ((equal? (f (first xs)) (f (first (rest xs))))
+                 (self (pair (first xs) (rest (rest xs))) acc))
+               (#t (self (rest xs) (pair (first xs) acc)))))
+           lst ()))))
     (method intersperse (self sep lst)
       (doc "Insert a separator between each element." (param sep ANY "Separator element") (param lst LIST "List"))
+      (def go (fn (self xs acc)
+        (if (null? (rest xs)) (%reverse (pair (first xs) acc))
+          (self (rest xs) (pair sep (pair (first xs) acc))))))
       (match
         ((null? lst) ())
         ((null? (rest lst)) lst)
-        (#t (pair (first lst) (pair sep (recur self sep (rest lst)))))))
+        (#t (go lst ()))))
     (method transpose (self lsts)
       (doc "Transpose rows and columns of a list of lists." (param lsts LIST "List of lists") (returns LIST "Transposed list of lists"))
-      (if (or (null? lsts) (List any? null? lsts)) ()
-        (pair (List map first lsts) (recur self (List map rest lsts)))))
+      (def go (fn (self ls acc)
+        (if (if (null? ls) #t (List any? null? ls)) (%reverse acc)
+          (self (List map rest ls) (pair (List map first ls) acc)))))
+      (go lsts ()))
     (method update (self n val lst)
       (doc "Replace the element at index n (coerced to INT)." (param n INT "Index to update") (param val ANY "New value") (param lst LIST "List"))
       (def k (%list->int n "List update: index not convertible to INT"))
-      (def go (fn (self j xs)
+      (def %rev-onto (fn (self l tail)
+        (match ((null? l) tail) (#t (self (rest l) (pair (first l) tail))))))
+      (def go (fn (self j xs pre)
         (match
           ((null? xs) ())
-          ((= j 0) (pair val (rest xs)))
-          (#t (pair (first xs) (self (- j 1) (rest xs)))))))
-      (go k lst))
+          ((= j 0) (%rev-onto pre (pair val (rest xs))))
+          (#t (self (- j 1) (rest xs) (pair (first xs) pre))))))
+      (go k lst ()))
     (method insert (self n val lst)
       (doc "Insert a value at index n (coerced to INT; clamped: n<=0 prepends, n>=length appends)." (param n INT "Insertion index") (param val ANY "Value to insert") (param lst LIST "List"))
       (def k (%list->int n "List insert: index not convertible to INT"))
-      (def go (fn (self j xs)
+      (def %rev-onto (fn (self l tail)
+        (match ((null? l) tail) (#t (self (rest l) (pair (first l) tail))))))
+      (def go (fn (self j xs pre)
         (match
-          ((<= j 0) (pair val xs))
+          ((<= j 0) (%rev-onto pre (pair val xs)))
           ; past the end: clamp to append -- without this guard the recursion
           ; reaches (first ()) (unchecked car, UB)
-          ((null? xs) (pair val ()))
-          (#t (pair (first xs) (self (- j 1) (rest xs)))))))
-      (go k lst))
+          ((null? xs) (%rev-onto pre (pair val ())))
+          (#t (self (- j 1) (rest xs) (pair (first xs) pre))))))
+      (go k lst ()))
     (method remove (self start n lst)
       (doc "Remove n elements starting at index (both coerced to INT)." (param start INT "Start index") (param n INT "Number of elements to remove") (param lst LIST "List"))
       (def s0 (%list->int start "List remove: start not convertible to INT"))
       (def k (%list->int n "List remove: count not convertible to INT"))
-      (def go (fn (self i j xs)
+      (def %rev-onto (fn (self l tail)
+        (match ((null? l) tail) (#t (self (rest l) (pair (first l) tail))))))
+      (def go (fn (self i j xs pre)
         (match
           ((null? xs) ())
-          ((> i 0) (pair (first xs) (self (- i 1) j (rest xs))))
-          ((> j 0) (self 0 (- j 1) (rest xs)))
-          (#t xs))))
-      (go s0 k lst))
+          ((> i 0) (self (- i 1) j (rest xs) (pair (first xs) pre)))
+          ((> j 0) (self 0 (- j 1) (rest xs) pre))
+          (#t (%rev-onto pre xs)))))
+      (go s0 k lst ()))
     (method adjust (self n f lst)
       (doc "Apply a function to the element at index n (coerced to INT)." (param n INT "Index to adjust") (param f CALLABLE "Transformation function") (param lst LIST "List"))
       (def k (%list->int n "List adjust: index not convertible to INT"))
-      (def go (fn (self j xs)
+      (def %rev-onto (fn (self l tail)
+        (match ((null? l) tail) (#t (self (rest l) (pair (first l) tail))))))
+      (def go (fn (self j xs pre)
         (match
           ((null? xs) ())
-          ((= j 0) (pair (f (first xs)) (rest xs)))
-          (#t (pair (first xs) (self (- j 1) (rest xs)))))))
-      (go k lst))
+          ((= j 0) (%rev-onto pre (pair (f (first xs)) (rest xs))))
+          (#t (self (- j 1) (rest xs) (pair (first xs) pre))))))
+      (go k lst ()))
     ; --- Type predicate / Membership / Association ---
     (method list? (self x)
       (doc "Test if a value is a proper list." (param x ANY "Value to test") (returns BOOL "t if proper list"))
       (if (null? x) #t (if (pair? x) (recur self (rest x)) #f)))
-    (method memq (self x lst)
-      (doc "Find first occurrence by identity (eq?). Returns the tail from the match, or nil -- a hit is always a pair, so the nil miss is unambiguous." (param x ANY "Value to search for") (param lst LIST "List"))
-      (if (null? lst) () (if (eq? x (first lst)) lst (recur self x (rest lst)))))
-    (method member (self x lst)
-      (doc "Find first occurrence by equality (equal?). Returns the tail from the match, or nil -- a hit is always a pair, so the nil miss is unambiguous." (param x ANY "Value to search for") (param lst LIST "List"))
-      (if (null? lst) () (if (equal? x (first lst)) lst (recur self x (rest lst)))))
-    (method assq (self key alist)
-      (doc "Look up a key in an alist by identity (eq?). Returns the (key . val) assoc itself, or nil -- the presence-unambiguous entry door; (Assoc get) is the eq? value door." (param key ANY "Key to search for") (param alist LIST "Association list"))
-      (if (null? alist) ()
-        (if (eq? key (first (first alist))) (first alist) (recur self key (rest alist)))))
-    (method assoc (self key alist)
-      (doc "Look up a key in an alist by equality (equal?). Returns the (key . val) assoc itself, or nil. NOTE: Assoc get / assoc-get compare with eq?, not equal? -- string or number keys hit here and miss there." (param key ANY "Key to search for") (param alist LIST "Association list"))
-      (if (null? alist) ()
-        (if (equal? key (first (first alist))) (first alist) (recur self key (rest alist)))))
     (method second (self x)
       (doc "Return the second element of a list." (param x LIST "A list with at least two elements") (returns ANY "The second element"))
       (first (rest x)))
@@ -8874,6 +11133,10 @@
 ; Gen: lazy generators (unfold-based). Needs object/list/vector, all above.
 ; ---- begin lib/x/type/gen.x ----
 ; gen.x -- Gen: lazy generators.
+;
+; One of the three iteration tiers -- Seq defines encodings, Iter drives
+; sequences, Gen composes lazy pipelines; the full statement lives in
+; x/protocol/seq.x's header (#365).
 ;
 ; A generator is an UNFOLD: a step function over a state.
 ;   (step state) -> (value . next-state)   -- a value was produced
@@ -9154,16 +11417,20 @@
   (example "(((Gen range 0 6) filter (fn (_ x) (< x 3))) ->list)" "(0 1 2)")
   "Lazy generators: produce-on-demand sequences with the usual functional toolbox.")
 ; ---- end lib/x/type/gen.x ----
-; ---- begin lib/x/reader/token.x ----
-; token.x -- Token: composable tokenizer state-machine builders.
+; ---- begin lib/x/reader/analyser.x ----
+; analyser.x -- Analyser: composable tokenizer state-machine builders.
+; (Renamed from Token, #359: it builds analyse-state machines, not tokens --
+; and Tok, the token-stream class in type/buf.x, is the unrelated neighbour
+; the old name collided with. The catalog ns for the terminators stays
+; `token`: it names the tokenizer domain, not this class.)
 ;
-; The builders run at type-build (setup) time, so they are Token methods. The
+; The builders run at type-build (setup) time, so they are Analyser methods. The
 ; three TERMINATORS (accept/accept-inclusive/reject), however, are invoked
 ; per-character INSIDE reader/analyse lambdas, where class dispatch would
 ; allocate and risk a GC mid-C-reader-callback. So their logic lives in
 ; %-private functions, registered in the catalog under ns `token`; reader-hot
 ; callers (logo/types.x) fetch-and-cache them and call the cached refs directly
-; -- no dispatch on the hot path. The Token class methods are the cold-call API.
+; -- no dispatch on the hot path. The Analyser class methods are the cold-call API.
 (import x/type/char)
 (import x/type/class)
 ; Fetch the char/int casts from the catalog (ns `char`/`int` utility members de-registered, R5).
@@ -9172,7 +11439,7 @@
 ; --- Terminators: %-private logic + catalog registration ---
 ; States call these to finish: accept (rewind last char), accept-inclusive
 ; (keep it), reject (no match). Registered so reader-context consumers fetch
-; raw refs rather than dispatching (Token accept ...) per character.
+; raw refs rather than dispatching (Analyser accept ...) per character.
 (def %tok-accept
   (fn (_ buffer score chr)
     (%buffer-unread buffer)
@@ -9191,16 +11458,18 @@
 (def %make-digit-state
   (fn (_ done)
     (fn (self buffer score chr)
-      (if (and (>= chr 48) (<= chr 57))
+      ; Nested if, NOT and/or (#343): operatives expand per evaluation
+      ; and these states run per character of every token.
+      (if (if (>= chr 48) (<= chr 57) #f)
         self
         (done buffer score chr)))))
 
 (def %make-xdigit-state
   (fn (_ done)
     (fn (self buffer score chr)
-      (if (or (and (>= chr 48) (<= chr 57))
-              (and (>= chr 65) (<= chr 70))
-              (and (>= chr 97) (<= chr 102)))
+      (if (if (if (>= chr 48) (<= chr 57) #f) #t
+            (if (if (>= chr 65) (<= chr 70) #f) #t
+              (if (>= chr 97) (<= chr 102) #f)))
         self
         (done buffer score chr)))))
 
@@ -9221,7 +11490,7 @@
 (def %make-range-state
   (fn (_ lo hi done)
     (fn (self buffer score chr)
-      (if (and (>= chr lo) (<= chr hi))
+      (if (if (>= chr lo) (<= chr hi) #f)
         self
         (done buffer score chr)))))
 
@@ -9265,11 +11534,11 @@
   (fn (_ ch next)
     (%make-char-state ch next next)))
 
-; --- The Token class: the API over the builders + terminators ---
-(def-class Token ()
+; --- The Analyser class: the API over the builders + terminators ---
+(def-class Analyser ()
   (doc "Composable tokenizer state-machine builders. A state is (fn (self buffer score chr) ...) returning self to loop, another state to transition, a score to accept, or nil to reject."
-    (note "Terminators (accept/accept-inclusive/reject) run per-character in reader lambdas. Reader-context callers must fetch them raw -- (prim-ref 'token 'accept) -- and call the cached ref, NOT (Token accept ...) (class dispatch allocates, hazardous mid-reader-callback). The class methods are for cold call sites.")
-    (sample "(Token make-digit-state (Token make-char-state 46 (Token make-digit-state acc) ()))" "an integer.fractional matcher (acc = an accept terminator)"))
+    (note "Terminators (accept/accept-inclusive/reject) run per-character in reader lambdas. Reader-context callers must fetch them raw -- (prim-ref 'token 'accept) -- and call the cached ref, NOT (Analyser accept ...) (class dispatch allocates, hazardous mid-reader-callback). The class methods are for cold call sites.")
+    (sample "(Analyser make-digit-state (Analyser make-char-state 46 (Analyser make-digit-state acc) ()))" "an integer.fractional matcher (acc = an accept terminator)"))
   (static
     ; --- terminators ---
     (method accept (self (param buffer ANY "Token buffer") (param score ANY "Score atom") (param chr ANY "Current character (ignored)"))
@@ -9289,7 +11558,7 @@
     (method make-digit-state (self (param done CALLABLE "Called on non-digit: (done buffer score chr)"))
       (doc "A state that loops while reading digits [0-9], then calls done on a non-digit."
         (returns CALLABLE "Analyzer state")
-        (sample "(Token make-digit-state done)" "consumes digits then calls done"))
+        (sample "(Analyser make-digit-state done)" "consumes digits then calls done"))
       (%make-digit-state done))
 
     (method make-xdigit-state (self (param done CALLABLE "Called on non-xdigit"))
@@ -9302,14 +11571,14 @@
                                   (param fail CALLABLE "Reached on non-match (or nil to reject)"))
       (doc "A state matching a single character, transitioning to next or fail."
         (returns CALLABLE "Analyzer state")
-        (sample "(Token make-char-state 46 frac-state ())" "match '.' then frac-state"))
+        (sample "(Analyser make-char-state 46 frac-state ())" "match '.' then frac-state"))
       (%make-char-state ch next fail))
 
     (method make-pred-state (self (param pred CALLABLE "Predicate: (pred chr) -> bool")
                                   (param done CALLABLE "Called when pred fails"))
       (doc "A state that loops while pred returns truthy, then calls done."
         (returns CALLABLE "Analyzer state")
-        (sample "(Token make-pred-state (fn (_ c) (Char alphabetic? c)) done)" "match letters"))
+        (sample "(Analyser make-pred-state (fn (_ c) (Char alphabetic? c)) done)" "match letters"))
       (%make-pred-state pred done))
 
     (method make-range-state (self (param lo INT "Lowest accepted character code")
@@ -9317,14 +11586,14 @@
                                    (param done CALLABLE "Called on out-of-range character"))
       (doc "A state that loops while the character is in the inclusive range [lo, hi]."
         (returns CALLABLE "Analyzer state")
-        (sample "(Token make-range-state 65 90 done)" "match uppercase A-Z"))
+        (sample "(Analyser make-range-state 65 90 done)" "match uppercase A-Z"))
       (%make-range-state lo hi done))
 
     (method make-alt-state (self (param state-a CALLABLE "First alternative")
                                  (param state-b CALLABLE "Second alternative"))
       (doc "Try state-a on the current character; if it rejects (nil), try state-b."
         (returns CALLABLE "Analyzer state")
-        (sample "(Token make-alt-state (Token make-char-state 43 next ()) (Token make-char-state 45 next ()))" "match + or -"))
+        (sample "(Analyser make-alt-state (Analyser make-char-state 43 next ()) (Analyser make-char-state 45 next ()))" "match + or -"))
       (%make-alt-state state-a state-b))
 
     (method make-str-state (self (param s STRING "Literal string to match")
@@ -9332,7 +11601,7 @@
                                  (param fail CALLABLE "Reached on mismatch (or nil to reject)"))
       (doc "A chain of char-states matching each byte of a literal string in sequence."
         (returns CALLABLE "Analyzer state")
-        (sample "(Token make-str-state \"0x\" hex-digits ())" "match '0x' prefix"))
+        (sample "(Analyser make-str-state \"0x\" hex-digits ())" "match '0x' prefix"))
       (%make-str-state s next fail))
 
     (method make-count-state (self (param n INT "Exact number of characters to match")
@@ -9340,7 +11609,7 @@
                                    (param done CALLABLE "Called after exactly n matches"))
       (doc "Match exactly n characters satisfying pred, then call done. Rejects if fewer match. With n=0, returns done directly."
         (returns CALLABLE "Analyzer state (or done when n=0)")
-        (sample "(Token make-count-state 4 (fn (_ c) (Char numeric? c)) done)" "exactly 4 digits"))
+        (sample "(Analyser make-count-state 4 (fn (_ c) (Char numeric? c)) done)" "exactly 4 digits"))
       (%make-count-state n pred done))
 
     (method make-min-state (self (param n INT "Minimum number of characters to match")
@@ -9348,21 +11617,21 @@
                                  (param done CALLABLE "Called after n+ matches on a non-matching char"))
       (doc "Match at least n characters satisfying pred, then loop more, calling done when pred fails."
         (returns CALLABLE "Analyzer state")
-        (sample "(Token make-min-state 1 (fn (_ c) (Char numeric? c)) done)" "1+ digits"))
+        (sample "(Analyser make-min-state 1 (fn (_ c) (Char numeric? c)) done)" "1+ digits"))
       (%make-min-state n pred done))
 
     (method make-optional-char (self (param ch INT "Character code to optionally match")
                                      (param next CALLABLE "Next state (reached whether or not ch matched)"))
       (doc "Match a character if present, skip it if not; either way continue to next."
         (returns CALLABLE "Analyzer state")
-        (sample "(Token make-optional-char 43 digits)" "optionally match '+' then digits"))
+        (sample "(Analyser make-optional-char 43 digits)" "optionally match '+' then digits"))
       (%make-optional-char ch next))))
 
-(doc (provide x/reader/token Token)
+(doc (provide x/reader/analyser Analyser)
   (note "States receive (self buffer score chr): return self to loop, another state to transition, a score to accept, nil to reject.")
-  (note "Terminators registered under catalog ns `token` (accept/accept-inclusive/reject) -- reader-context callers fetch-and-cache them; never dispatch (Token accept ...) per character.")
-  "Composable tokenizer state-machine builders on the Token class.")
-; ---- end lib/x/reader/token.x ----
+  (note "Terminators registered under catalog ns `token` (accept/accept-inclusive/reject) -- reader-context callers fetch-and-cache them; never dispatch (Analyser accept ...) per character.")
+  "Composable tokenizer state-machine builders on the Analyser class.")
+; ---- end lib/x/reader/analyser.x ----
 
 ; Quasi-quoting
 ; ---- begin lib/x/core/quasi.x ----
@@ -9449,8 +11718,6 @@
 (def %buffer-token (prim-ref (lit buf) (lit tok)))
 (def %buffer-last-char (prim-ref (lit buf) (lit last-char)))
 (def %token-read (prim-ref (lit tok) (lit read)))
-; Fetch the char/int casts from the catalog (ns `char`/`int` utility members de-registered, R5).
-(def %char->integer (prim-ref (lit char) (lit ->int)))
 
 
 (def %quasi-accept
@@ -9460,17 +11727,17 @@
 ; After a comma, an @ makes it unquote-splicing; either way score one char.
 (def %unquote-after-comma
   (fn (_ buffer score chr)
-    (if (= chr 64)
+    (if (= chr #\@)
       (%score-set score 1 buffer)
       (%seq (%buffer-unread buffer) (%score-set score 1 buffer)))))
 
 ; --- analyse: score a leading ` or , as a one-char token ---
 
 (def %quasi-analyse
-  (fn (_ buffer score chr) (if (= chr 96) %quasi-accept ())))
+  (fn (_ buffer score chr) (if (= chr #\`) %quasi-accept ())))
 
 (def %unquote-analyse
-  (fn (_ buffer score chr) (if (= chr 44) %unquote-after-comma ())))
+  (fn (_ buffer score chr) (if (= chr #\,) %unquote-after-comma ())))
 
 ; --- read: confirm the token, then wrap the following expression ---
 ; ' ` , are delimiters, so a token ending in ` or , can only be that macro
@@ -9479,16 +11746,16 @@
 
 (def %quasi-read
   (fn (_ buffer . rest)
-    (if (= (%buffer-last-char buffer) 96)
+    (if (= (%buffer-last-char buffer) #\`)
       (pair (lit quasi) (pair (%token-read buffer) ()))
       ())))
 
 (def %unquote-read
   (fn (_ buffer . rest)
-    (if (= (%buffer-last-char buffer) 44)
+    (if (= (%buffer-last-char buffer) #\,)
       (pair (lit unquote) (pair (%token-read buffer) ()))
-      (if (= (%buffer-last-char buffer) 64)
-        (if (= (%char->integer (%str-ref (%buffer-token buffer) 0)) 44)
+      (if (= (%buffer-last-char buffer) #\@)
+        (if (= (%str-ref (%buffer-token buffer) 0) #\,)
           (pair (lit unquote-splicing) (pair (%token-read buffer) ()))
           ())
         ()))))
@@ -9537,11 +11804,11 @@ symbol type by lit-reader.x.")
     (%seq (%buffer-unread buffer) (%score-set score 1 buffer))))
 
 (def %lit-analyse
-  (fn (_ buffer score chr) (if (= chr 39) %lit-accept ())))
+  (fn (_ buffer score chr) (if (= chr #\') %lit-accept ())))
 
 (def %lit-read
   (fn (_ buffer . rest)
-    (if (= (%buffer-last-char buffer) 39)
+    (if (= (%buffer-last-char buffer) #\')
       (pair (lit lit) (pair (%token-read buffer) ()))
       ())))
 
@@ -9549,79 +11816,244 @@ symbol type by lit-reader.x.")
 ; binding keep it allocation-free on the per-char delimiter path.
 (def %macro-delimit
   (fn (_ buffer . rest)
-    (if (if (= (%buffer-last-char buffer) 39) #t
-          (if (= (%buffer-last-char buffer) 96) #t
-            (= (%buffer-last-char buffer) 44)))
+    (if (if (= (%buffer-last-char buffer) #\') #t
+          (if (= (%buffer-last-char buffer) #\`) #t
+            (= (%buffer-last-char buffer) #\,)))
       (%seq (%buffer-unread buffer) buffer)
       ())))
 
 ; --- $"...{expr}..." string interpolation --------------------------------
-; $"a{x}b" parses at READ time into the call (Str8 str "a" x "b"): %interp-read
-; runs the hole parser (%interp-forms) and emits the call directly.  Each hole is
-; thus a plain sub-expression that evaluates in place, in whatever env the literal
-; sits in -- no eval-time wrapper, no operative needed for the caller's scope.
+; $"a{x}b" parses at READ time into the call (Str8 str "a" x "b"): the analyser
+; scores the whole literal as one token and %interp-read splits it, emitting the
+; call directly.  Each hole is thus a plain sub-expression that evaluates in
+; place, in whatever env the literal sits in -- no eval-time wrapper, no
+; operative needed for the caller's scope.
+;
+; The analyser is a state machine because a hole holds arbitrary code, and code
+; contains characters that would otherwise end the token: a string inside a hole
+; ($"{(join " " xs)}"), a nested literal ($"{$"{c}"}"), a #\" or #\} character
+; literal.  Each state is a closure carrying the state to RESUME when the
+; construct it opened closes, so nesting needs neither a depth counter nor any
+; shared mutable state -- which matters because %interp-read re-enters the
+; tokenizer for the holes, and shared analyser state would have to survive that.
+; Allocating a state per construct is the protocol's supported path:
+; x_token_analyse roots whatever handler a state returns ("Replace Analyser").
+; Callback discipline holds inside every state body: primitive `if` only, never
+; an op (docs/syntax.md, "reader-callback code").
 ;
 ; Parsing was once DEFERRED to eval time: the literal read as (%interp-str X), an
 ; op that re-tokenized the holes on every evaluation, to keep token-read-string
 ; out of the GC-sensitive tokenizer loop.  That rationale is now obsolete -- GC is
 ; explicit-only (pure allocators never collect), so re-entering the tokenizer from
-; a reader handler is safe (%interp-read already calls token-read for the string
-; itself).  Do NOT move parsing back to eval time: besides re-parsing on every
+; a reader handler is safe -- %interp-read does it for every hole and every
+; literal chunk.  Do NOT move parsing back to eval time: besides re-parsing on every
 ; eval, token-read-string's tokenizer re-entry leaves the base's env register
 ; dirty, and an if-tail (TCO) position inherits that dirty env -- stranding a
 ; later interpolation's variable as Unbound.  Parsing at read time sidesteps it
 ; entirely (the env is never touched mid-evaluation).
 ; (display/str themselves live in boot/string.x and the Str8 class respectively.)
 (def %str-append        (prim-ref (lit str)  (lit append)))
-(def %char->int         (prim-ref (lit char) (lit ->int)))
 (def %token-read-string (prim-ref (lit tok)  (lit read-str)))
+(def %buffer-token      (prim-ref (lit buf)  (lit tok)))
 
-; Index of byte `code` in s at/after i, else len.
-(def %str-index
-  (fn (self s code i len)
-    (if (>= i len) len
-      (if (= (%char->int (%str-ref s i)) code) i
-        (self s code (+ i 1) len)))))
+; The analyser, in two pieces like the rest of the quote family: the per-char
+; entry test is its own def so the tower can compile it (boot/tower-compiled.x
+; captures this state as a free variable), and the state machine it hands off to
+; stays interpreted -- it only runs INSIDE a literal, never on the hot path of
+; ordinary characters.
+;
+; %interp-after-dollar: a $ has been seen.  A " opens the literal and the scan
+; runs to the quote that closes it; anything else declines, leaving a bare $ (or
+; $foo) an ordinary symbol.
+(def %interp-after-dollar
+  (let ((mk-text ()) (mk-open ()) (mk-hole ()) (mk-str ()))
+    ; Literal text.  `k` is the state to resume when this literal's closing
+    ; quote arrives; nil for the outermost literal, which scores the token
+    ; instead (returning the score object is the protocol's "done").
+    (set! mk-text
+      (fn (_ k)
+        (let ((body ()) (esc ()))
+          (set! body
+            (fn (self buffer score chr)
+              (match
+                ((= chr #\\) esc)
+                ((= chr #\") (if k k (%score-set score 1 buffer)))
+                ((= chr #\{) (mk-open body))
+                (#t self))))
+          (set! esc (fn (_ _ _ _) body))
+          body)))
+    ; Just past a { in text: doubled ({{) is a literal brace and text resumes,
+    ; otherwise a hole opens and this character is its first.
+    (set! mk-open
+      (fn (_ back)
+        (fn (_ buffer score chr)
+          (if (= chr #\{) back
+            ((mk-hole back) buffer score chr)))))
+    ; Inside {...}: expression context.  " opens a plain string, $" a nested
+    ; literal, #\ a character literal (so #\" and #\} cannot derail the scan),
+    ; #/ a regex literal (whose {2,3} quantifiers otherwise read as braces),
+    ; } closes the hole and resumes `back`.
+    (set! mk-hole
+      (fn (_ back)
+        (let ((body ()) (dol ()) (hash ()) (charlit ()) (rex ()) (rex-esc ()))
+          (set! body
+            (fn (self buffer score chr)
+              (match
+                ((= chr #\") (mk-str self))
+                ((= chr #\}) back)
+                ((= chr #\$) dol)
+                ((= chr #\#) hash)
+                (#t self))))
+          (set! dol
+            (fn (_ buffer score chr)
+              (if (= chr #\") (mk-text body) (body buffer score chr))))
+          (set! hash
+            (fn (_ buffer score chr)
+              (match
+                ((= chr #\\) charlit)
+                ((= chr #\/) rex)
+                (#t (body buffer score chr)))))
+          (set! charlit (fn (_ _ _ _) body))
+          (set! rex
+            (fn (self buffer score chr)
+              (match
+                ((= chr #\\) rex-esc)
+                ((= chr #\/) body)
+                (#t self))))
+          (set! rex-esc (fn (_ _ _ _) rex))
+          body)))
+    ; A "..." string inside a hole: only \ and the closing " matter.
+    (set! mk-str
+      (fn (_ back)
+        (let ((body ()) (esc ()))
+          (set! body
+            (fn (self buffer score chr)
+              (match
+                ((= chr #\\) esc)
+                ((= chr #\") back)
+                (#t self))))
+          (set! esc (fn (_ _ _ _) body))
+          body)))
+    (fn (_ buffer score chr) (if (= chr #\") (mk-text ()) ()))))
 
-; Interpolated string -> argument list for (Str8 str ...): literal chunks
-; interleaved with parsed hole expressions.  { = 123, } = 125.  A single { opens
-; a hole; {{ and }} are literal braces; a lone } is a literal brace too.
-(def %interp-forms
-  (fn (self s i len)
-    (if (>= i len) ()
-      (let ((o (%str-index s 123 i len))                    ; next {
-            (c (%str-index s 125 i len)))                   ; next }
-        (let ((p (if (< o c) o c)))                         ; whichever brace comes first
-          (if (>= p len)
-            (list (%substring s i len))                      ; no more braces: trailing literal
-            (if (= (%char->int (%str-ref s p)) 123)
-              ; a {  -- either a hole or a {{ literal
-              (if (and (< (+ p 1) len) (= (%char->int (%str-ref s (+ p 1))) 123))
-                (pair (%substring s i (+ p 1)) (self s (+ p 2) len))   ; {{ -> literal {
-                (let ((close (%str-index s 125 (+ p 1) len)))         ; hole: { expr }
-                  (pair (%substring s i p)                             ; text before {
-                    ; pad with a trailing space so a bare-symbol hole ({x}) terminates its
-                    ; token at end-of-buffer (token-read-string drops an unterminated tail).
-                    (pair (first (%token-read-string (%base) (%str-append (%substring s (+ p 1) close) " ")))
-                      (self s (+ close 1) len)))))
-              ; a }  -- }} or a lone }, both literal (one brace either way)
-              (if (and (< (+ p 1) len) (= (%char->int (%str-ref s (+ p 1))) 125))
-                (pair (%substring s i (+ p 1)) (self s (+ p 2) len))   ; }} -> literal }
-                (pair (%substring s i (+ p 1)) (self s (+ p 1) len)))))))))) ; lone } -> literal }
-
-; $ (byte 36) reader: one-char token, then parse the following string.
-(def %interp-accept
-  (fn (_ buffer score _)
-    (%seq (%buffer-unread buffer) (%score-set score 1 buffer))))
 (def %interp-analyse
-  (fn (_ buffer score chr) (if (= chr 36) %interp-accept ())))
+  (fn (_ buffer score chr) (if (= chr #\$) %interp-after-dollar ())))
+
+; Interpolated text -> argument list for (Str8 str ...): literal chunks
+; interleaved with parsed hole expressions.  A single { opens a hole; {{ and }}
+; are literal braces, as is a lone }; \ escapes the next character, so \{ is a
+; literal brace too.  The hole scanners mirror the analyser's states -- the two
+; must agree on where a hole ends, so change them together.
+(def %interp-forms
+  (let ((next? ()) (brace ()) (hole-end ()) (str-end ()) (rex-end ())
+        (text-end ()) (chunk ()) (walk ()))
+    ; Is the character after i this one?  False at the end of the text.
+    (set! next?
+      (fn (_ s i len c)
+        (if (< (+ i 1) len) (= (%str-ref s (+ i 1)) c) #f)))
+    ; Next unescaped brace at/after i, else len.
+    (set! brace
+      (fn (self s i len)
+        (match
+          ((>= i len) len)
+          ((= (%str-ref s i) #\\) (self s (+ i 2) len))
+          ((= (%str-ref s i) #\{) i)
+          ((= (%str-ref s i) #\}) i)
+          (#t (self s (+ i 1) len)))))
+    ; Index of the } closing a hole whose body starts at i.
+    (set! hole-end
+      (fn (self s i len)
+        (match
+          ((>= i len) len)
+          ((= (%str-ref s i) #\}) i)
+          ((= (%str-ref s i) #\") (self s (str-end s (+ i 1) len) len))
+          ((and (= (%str-ref s i) #\#) (next? s i len #\\))
+            (self s (+ i 3) len))                                ; #\X
+          ((and (= (%str-ref s i) #\#) (next? s i len #\/))
+            (self s (rex-end s (+ i 2) len) len))                ; #/.../
+          ((and (= (%str-ref s i) #\$) (next? s i len #\"))
+            (self s (text-end s (+ i 2) len) len))               ; nested $"..."
+          (#t (self s (+ i 1) len)))))
+    ; Index just past the " closing a string whose body starts at i.
+    (set! str-end
+      (fn (self s i len)
+        (match
+          ((>= i len) len)
+          ((= (%str-ref s i) #\\) (self s (+ i 2) len))
+          ((= (%str-ref s i) #\") (+ i 1))
+          (#t (self s (+ i 1) len)))))
+    ; Index just past the / closing a regex whose pattern starts at i.
+    (set! rex-end
+      (fn (self s i len)
+        (match
+          ((>= i len) len)
+          ((= (%str-ref s i) #\\) (self s (+ i 2) len))
+          ((= (%str-ref s i) #\/) (+ i 1))
+          (#t (self s (+ i 1) len)))))
+    ; Index just past the " closing a nested literal whose text starts at i.
+    (set! text-end
+      (fn (self s i len)
+        (match
+          ((>= i len) len)
+          ((= (%str-ref s i) #\\) (self s (+ i 2) len))
+          ((= (%str-ref s i) #\") (+ i 1))
+          ((and (= (%str-ref s i) #\{) (next? s i len #\{))
+            (self s (+ i 2) len))                                ; {{
+          ((= (%str-ref s i) #\{)
+            (self s (+ (hole-end s (+ i 1) len) 1) len))         ; nested hole
+          (#t (self s (+ i 1) len)))))
+    ; A chunk is RAW text: hand it back to the string reader so \n and friends
+    ; mean exactly what they mean in an ordinary "..." -- one escape table, and
+    ; it stays in C.  The chunk cannot contain a bare " (that would have closed
+    ; the literal), so re-quoting it is safe.
+    (set! chunk
+      (fn (_ text)
+        (first (%token-read-string (%base)
+          (%str-append "\"" (%str-append text "\" "))))))
+    (set! walk
+      (fn (self s i len)
+        (if (>= i len) ()
+          (let ((p (brace s i len)))
+            (match
+              ((>= p len) (list (chunk (%substring s i len))))   ; trailing text
+              ; {{ and }} are one literal brace each: emit through the brace,
+              ; resume past its twin.
+              ((and (= (%str-ref s p) #\{) (next? s p len #\{))
+                (pair (chunk (%substring s i (+ p 1))) (self s (+ p 2) len)))
+              ((and (= (%str-ref s p) #\}) (next? s p len #\}))
+                (pair (chunk (%substring s i (+ p 1))) (self s (+ p 2) len)))
+              ((= (%str-ref s p) #\})                            ; lone }
+                (pair (chunk (%substring s i (+ p 1))) (self s (+ p 1) len)))
+              (#t                                                ; hole: { expr }
+                (let ((close (hole-end s (+ p 1) len)))
+                  ; pad with a trailing space so a bare-symbol hole ({x})
+                  ; terminates its token at end-of-buffer (token-read-string
+                  ; drops an unterminated tail).
+                  (let ((forms (%token-read-string (%base)
+                                 (%str-append (%substring s (+ p 1) close) " "))))
+                    (pair (chunk (%substring s i p))              ; text before {
+                      ; An EMPTY hole ({} or whitespace) reads no form at all,
+                      ; and `first` is unchecked -- (first ()) is UB, and it
+                      ; segfaulted the READER before evaluation ever began
+                      ; (#159).  Nothing to splice, so splice nothing: $"a{}b"
+                      ; is "ab", the same way $"" is "".
+                      (if (null? forms)
+                        (self s (+ close 1) len)
+                        (pair (first forms) (self s (+ close 1) len))))))))))))
+    walk))
+
+; The winning token is the whole literal: strip $" and the closing ", split what
+; is left.  The last-character test is the cheap guard -- no ordinary symbol ends
+; in a quote -- so the token text is only materialized for a real candidate.
 (def %interp-read
   (fn (_ buffer . rest)
-    (if (= (%buffer-last-char buffer) 36)
-      ; %token-read consumes the following string token; %interp-forms splits its
-      ; holes now, so we emit (Str8 str <chunk> <expr> ...) directly (see header).
-      (let ((s (%token-read buffer)))
-        (pair (lit Str8) (pair (lit str) (%interp-forms s 0 (%str-length s)))))
+    (if (= (%buffer-last-char buffer) #\")
+      (let ((tok (%buffer-token buffer)))
+        (if (and (> (%str-length tok) 2) (= (%str-ref tok 0) #\$))
+          (let ((s (%substring tok 2 (- (%str-length tok) 1))))
+            (pair (lit Str8)
+              (pair (lit str) (%interp-forms s 0 (%str-length s)))))
+          ()))
       ())))
 
 ; --- Place the readers on the symbol type ---
@@ -9726,7 +12158,7 @@ of readers on the symbol type.")
       (do (Sys dup2 3 0) (Sys close 3)))
     ; Turn sweep (see the module-top note).
     (%repl-collect)
-    (%set-first-int! %sigint-flag 0)
+    (%set-cell-int! %sigint-flag 0)
     (display %repl-prompt)
     ; The SIGINT handler stays installed across the read (boot installed
     ; it; no SA_RESTART, so ctrl-c pops a blocking read as EOF with
@@ -9742,18 +12174,18 @@ of readers on the symbol type.")
     ; so the cancel branch can un-poison it.  Resolved per read: filein
     ; is a chain with a cell per include.
     (def %repl-filein-cell (%reflect-base-cell 'filein))
-    (def %repl-filein-fd (%first-int (first %repl-filein-cell)))
+    (def %repl-filein-fd (%cell-int (first %repl-filein-cell)))
     (def %r
       (guard (err
           ; ctrl-c is visible on TWO channels: the raw flag (the read
           ; was interrupted), or a STOP error (the eval poll saw the
           ; flag while an x-level reader handler was mid-eval -- the
           ; poll CLEARS the flag before raising).
-          (if (if (= 1 (%first-int %sigint-flag)) #t
+          (if (if (= 1 (%cell-int %sigint-flag)) #t
                 (if (atom? err) (str=? (symbol->str err) "STOP") #f))
             (do
-              (%set-first-int! %sigint-flag 0)
-              (%set-first-int! (first %repl-filein-cell) %repl-filein-fd)
+              (%set-cell-int! %sigint-flag 0)
+              (%set-cell-int! (first %repl-filein-cell) %repl-filein-fd)
               ; Drop bytes the tokenizer had not consumed -- stale
               ; input must not leak into the next read.  Resolved
               ; inside the body: at load time the buffer-stack head is
@@ -9767,9 +12199,7 @@ of readers on the symbol type.")
             ; boot metadata for an error raised from the C reader (no
             ; form was being evaluated), so a file:line here would lie.
             (do
-              (%stderr "Error: ")
-              (%stderr (if (str? err) err (%repl-write-to-str err)))
-              (%stderr "\n")
+              (%stderr $"Error: {(if (str? err) err (%repl-write-to-str err))}\n")
               (Sys exit 1))))
         (%repl-read)))
     (if (%repl-same? %r %token-eof)
@@ -9778,7 +12208,7 @@ of readers on the symbol type.")
         (repl)
       (%seq
         (guard (err
-            (%set-first-int! %sigint-flag 0)
+            (%set-cell-int! %sigint-flag 0)
             (if (if (atom? err) (str=? (symbol->str err) "STOP") #f)
               (display "\n")
               ; %seq is BINARY (it is the primitive `do` is built on), so a
@@ -10041,14 +12471,14 @@ of readers on the symbol type.")
 ;
 ; Costs nothing on the int fast path: op_try fast-declines when NEITHER
 ; type carries ops, and INT keeps none. The tower is untouched by
-; construction -- float/rational/bignum handlers sit on their own types and
+; construction -- float/rational/bigint handlers sit on their own types and
 ; win their own dispatches. Two residual holes, both recorded on #52:
 ;   - nil-typed operands: op_try cannot consult a type that is not there.
 ;     The booleans left this class when BOOL claimed them (type/bool.x,
 ;     #101); (+ 1 ()) is caught by the C prims' nil guards.
 ;   - mixed tower/non-numeric ((+ 1.5 "a")): both sides own the op and
 ;     neither type absorbs the other, so op_try declines ("unrelated
-;     types: not ours to decide") -- pre-existing tower-side behavior.
+;     types: not ours to decide") -- pre-existing tower-side behaviour.
 ;
 ; `=` is deliberately NOT registered: it is value-word compare in the
 ; fallthrough, and interned symbols answer it correctly by pointer -- an
@@ -10262,7 +12692,12 @@ of readers on the symbol type.")
         (example "(Ansi highlight \"(def x 42)\")" "(def x 42)"))
       (if (not %ansi?)
         (display code)
-        (let ((%toks (%token-read-string (%base) code))
+        ; Terminated read, local on purpose: this file is boot-included,
+        ; so it cannot import the shared door (x/codec/xon).  Without the
+        ; appended space, read-str drops an unterminated final token
+        ; (#161) -- and highlight routinely sees mid-edit text whose last
+        ; token IS unterminated.
+        (let ((%toks (%token-read-string (%base) (Str8 append code " ")))
               (%go
                 (fn (self toks first?)
                   (unless (null? toks)
@@ -10293,8 +12728,6 @@ of readers on the symbol type.")
 (def %c-bool     (Ansi bold-red))
 (def %c-nil-val  (Ansi dim))
 (def %c-function (Ansi cyan))
-(def %c-regexp   (Ansi red))
-(def %c-punct    "")
 (def %c-rst      (Ansi reset))
 
 ; --- Syntax-highlighted recursive writer ---
@@ -10309,7 +12742,7 @@ of readers on the symbol type.")
 (def %ansi-write-list
   (fn (self obj)
     (if (null? (first obj))
-      (do (display %c-nil-val) (display "()") (display %c-rst))
+      (do (display %c-nil-val "()" %c-rst))
       (%ansi-write (first obj)))
     (unless (null? (rest obj))
       (if (not (pair? (rest obj)))
@@ -10321,11 +12754,11 @@ of readers on the symbol type.")
 (set! %ansi-write
   (fn (self obj)
     (if (null? obj)
-      (do (display %c-nil-val) (display "()") (display %c-rst))
+      (do (display %c-nil-val "()" %c-rst))
     (if (eq? obj #t)
-      (do (display %c-bool) (display "#t") (display %c-rst))
+      (do (display %c-bool "#t" %c-rst))
     (if (eq? obj #f)
-      (do (display %c-bool) (display "#f") (display %c-rst))
+      (do (display %c-bool "#f" %c-rst))
     (if (pair? obj)
       (do (display "(") (%ansi-write-list obj) (display ")"))
     (if (number? obj)
@@ -10361,13 +12794,7 @@ of readers on the symbol type.")
         'cond 'case 'doc 'note))
 
 (def %keyword?
-  (fn (self sym)
-    (def %go
-      (fn (self lst)
-        (if (null? lst) #f
-          (if (eq? (first lst) sym) #t
-            (self (rest lst))))))
-    (%go %keywords)))
+  (fn (_ sym) (%memq? sym %keywords)))
 
 ; Forward declaration for mutual recursion
 (def %ansi-write-code ())
@@ -10375,7 +12802,7 @@ of readers on the symbol type.")
 (def %ansi-write-code-list
   (fn (self obj)
     (if (null? (first obj))
-      (do (display %c-nil-val) (display "()") (display %c-rst))
+      (do (display %c-nil-val "()" %c-rst))
       (%ansi-write-code (first obj)))
     (unless (null? (rest obj))
       (if (not (pair? (rest obj)))
@@ -10404,16 +12831,16 @@ of readers on the symbol type.")
 (set! %ansi-write-code
   (fn (self obj)
     (if (null? obj)
-      (do (display %c-nil-val) (display "()") (display %c-rst))
+      (do (display %c-nil-val "()" %c-rst))
     (if (eq? obj #t)
-      (do (display %c-bool) (display "#t") (display %c-rst))
+      (do (display %c-bool "#t" %c-rst))
     (if (eq? obj #f)
-      (do (display %c-bool) (display "#f") (display %c-rst))
+      (do (display %c-bool "#f" %c-rst))
     (if (pair? obj)
       (let ((sugar (%code-sugar obj)))
         (if (null? sugar)
           (do (display "(") (%ansi-write-code-list obj) (display ")"))
-          (do (display %c-keyword) (display sugar) (display %c-rst)
+          (do (display %c-keyword sugar %c-rst)
               (%ansi-write-code (first (rest obj))))))
     (if (number? obj)
       (do (display %c-number) (write obj) (display %c-rst))
@@ -10421,8 +12848,8 @@ of readers on the symbol type.")
       (do (display %c-string) (write obj) (display %c-rst))
     (if (symbol? obj)
       (if (%keyword? obj)
-        (do (display %c-keyword) (display obj) (display %c-rst))
-        (do (display %c-symbol) (display obj) (display %c-rst)))
+        (do (display %c-keyword obj %c-rst))
+        (do (display %c-symbol obj %c-rst)))
     (if (char? obj)
       (do (display %c-char) (write obj) (display %c-rst))
     (write obj)))))))))))
@@ -10489,19 +12916,14 @@ of readers on the symbol type.")
         (do
           (display %lang-name)
           (unless (null? %lang-version)
-            (do (display " v") (display %lang-version)))
+            (do (display $" v{%lang-version}")))
           ; "x-lang" is the LANGUAGE's name, not a dialect's (#95) -- if
           ; an embedder names a dialect after the language itself,
           ; "x-lang v0.3.0 on x-lang" would read as a bug, so the suffix
           ; is suppressed for that one spelling.
           (unless (str=? %lang-name "x-lang")
             (display " on x-lang"))
-          (newline)
-          ; The two things a stranger cannot discover alone: how to get
-          ; help, and how to leave.  ctrl-d earned its place back when the
-          ; buffer layer learned to latch one-shot terminal EOF (#90).
-          (display "(help) for help; (quit) or ctrl-d to exit")
-          (newline))))))
+          (display "\n" "(help) for help; (quit) or ctrl-d to exit\n"))))))
 
 (doc (provide x/repl/banner)
   "Startup banner printed when the REPL launches.")
@@ -10520,6 +12942,8 @@ of readers on the symbol type.")
 ; Retroactive provides for the boot layer: those files load BEFORE the
 ; module system exists, so they cannot call provide themselves; registering
 ; them here makes them visible to (modules) and module-level (help).
+(doc (provide x/boot/engine)
+  "Boot: the engine seam -- the one place the library names its engine, carrying both contract includes and the engine root.")
 (doc (provide x/boot/registry)
   "Boot: the catalog protocol -- prim-ref and the instrument registry (loads first).")
 (doc (provide x/boot/operatives)

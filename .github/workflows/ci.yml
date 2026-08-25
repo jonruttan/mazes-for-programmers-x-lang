@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
 
 env:
-  X_LANG_VERSION: "v0.3.1-rc10"
+  X_LANG_VERSION: "v0.5.1"
 
 jobs:
   test:

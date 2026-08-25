@@ -3,13 +3,6 @@
 ;          "deps" — our own copy of the x-lang library modules we import
 ;          "."    — this repo itself, so maze/… resolves to maze/ in the
 ;                   standard layout (maze/grid@1.2.x provides maze/grid)
-;          deps must stay first: the lockfile is named after the first root
-;          (deps.lock.xon), and the wrapper's engine-pairing guard reads it
-;          from there -- reorder and the guard silently stops firing
-;          (x-lang#313). Safe only because deps/ holds no maze/ modules;
-;          do NOT run (Pin sync) until x-lang#223 lands, as it re-vendors
-;          this project's own modules into deps/ where they would shadow
-;          the real files.
 ;   src  — the tree the pin verbs scan to work out what to vendor
 ;   boot — the language itself: a verified amalgam from a release
 (root "deps")
