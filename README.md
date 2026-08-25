@@ -24,9 +24,12 @@ post by post. The series lives at
 in `deps.lock.xon` (no toolchain needed).
 
 The language itself is pinned: `pin.xon` boots a verified amalgam committed
-under `boot/`, and `deps.lock.xon` records the release it came from, that
-release's ISA fingerprint, and the amalgam's digest. An amalgam runs on the
-engine from its own release, so install the tarball for the tag the lock names.
+under `boot/`, and `deps.lock.xon` records the x-lang release it came from,
+the engine build it pairs with (`engine-release`), their fingerprints, and the
+amalgam's digest. The release tarball for the tag the lock's `(release …)`
+line names carries that engine, so one download covers both. Run against a
+release or engine that doesn't match the lock and the wrapper refuses with
+both sides named rather than booting a mismatched pair.
 
 Run a test with `x -f tests/smoke.x` — you should see the `pinned:` and
 `pinned boot:` notices on stderr.
