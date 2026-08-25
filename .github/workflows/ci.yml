@@ -50,14 +50,19 @@ jobs:
       # Until that's fixed, verify the vendored tree directly.
       - name: Overlay matches its lock
         run: |
+          # Bind the count before printing the marker: since v0.5.1,
+          # (Pin verify) prints its own matcher lines mid-evaluation, and
+          # a prefix displayed first ends up glued to those instead of to
+          # the count the grep below asserts on.
           cat > run-verify.x <<'XEOF'
           (import x/tool/pin)
-          (display "verify: ") (display (Pin verify "deps"))
+          (def n (Pin verify "deps"))
+          (display "verified-files: ") (display n)
           (newline)
           XEOF
           x -f run-verify.x | tee verify-out.txt
           rm -f run-verify.x
-          grep -qE "verify: [0-9]+" verify-out.txt || { echo "FAIL: overlay drifted from its lock"; exit 1; }
+          grep -qE "verified-files: [0-9]+" verify-out.txt || { echo "FAIL: overlay drifted from its lock"; exit 1; }
 
       - name: Tests
         run: |
