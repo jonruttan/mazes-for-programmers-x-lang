@@ -1,5 +1,5 @@
 ;; Cell class from Mazes for Programmers
-;; Formula 1.1-0 p.18#form.0
+;; Algorithm 2.1.0, p.18#alg.0
 (import x/type/set)
 
 (def-class Cell ()
