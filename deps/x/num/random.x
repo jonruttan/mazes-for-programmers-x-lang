@@ -1,4 +1,7 @@
 ; random.x -- pseudo- and hardware random number generation.
+; lint-known: Float Hex
+; ((r float) late-binds the Float class, the str8.x precedent -- random
+; takes no hard tower dependency; the method needs x/num/float loaded.)
 ;
 ; Two entropy backends behind one interface:
 ;
@@ -23,6 +26,9 @@
 (def %rand-mask32 4294967295)   ; 2^32 - 1: the xorshift REGISTER stays 32-bit
 (def %rand-span 2147483648)     ; 2^31: the size of the %bits output range
 (def %rand-default-seed 2463534242) ; a nonzero xorshift seed (Marsaglia)
+; Cached int prim (#335): ambient % routes through the tower's op
+; dispatch per draw; every operand here is int by construction.
+(def %rand-int% (prim-ref (lit int) (lit %)))
 
 (def-class Random ()
   (doc "A source of random integers with a pluggable entropy backend."
@@ -99,9 +105,9 @@
       (example "((Random sw 1) int 6)" "3"))
     ; (% bits n) alone is BIASED whenever n does not divide 2^31 (low values
     ; come up once more often); redraw above the largest exact multiple of n.
-    (let ((limit (- %rand-span (% %rand-span n))))
+    (let ((limit (- %rand-span (%rand-int% %rand-span n))))
       (let go ((b (self %bits)))
-        (if (< b limit) (% b n) (go (self %bits))))))
+        (if (< b limit) (%rand-int% b n) (go (self %bits))))))
 
   (method range (self lo hi)
     (doc "A random integer in [lo, hi) -- exclusive upper bound; `between` is the inclusive twin. The name carries the bound contract."
@@ -136,6 +142,47 @@
       (returns ANY "A random element")
       (example "((Random sw 5) choice (list 'a 'b 'c))" "'a"))
     (List ref (self int (List length lst)) lst))
+
+  (method float (self)
+    (doc "A uniform float in [0.0, 1.0) with 53-bit resolution -- two 31-bit draws, hi supplying 31 bits and lo's top 22 joining them, over 2^53 (#363). Late-bound like every cross-class call: needs x/num/float loaded."
+      (returns FLOAT "A float in [0, 1)")
+      (sample "((Random sw 1) float)" "0.000125900391254041"))
+    ; (Float from), the VALUE door -- the first cut used from-int, which
+    ; was the raw BITS door (renamed int->bits, #357): dividing coerced
+    ; bit patterns clustered every draw near [0.98, 1) instead of uniform.
+    (let ((hi (self %bits)) (lo (self %bits)))
+      (Float / (Float from (+ (* hi 4194304) (>> lo 9)))
+               (Float from 9007199254740992))))
+
+  (method uuid (self)
+    (doc "A random version-4 UUID string from this source -- 16 bytes with the version (byte 6) and IETF-variant (byte 8) bits set, rendered 8-4-4-4-12 lowercase hex (#375). A seeded software source yields reproducible UUIDs (tests); (Random hw) yields real ones. Late-bound: needs x/codec/hex loaded."
+      (returns STRING "\"xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx\"")
+      (sample "((Random hw) uuid)" "\"9f8b2c41-7d0a-4e3f-9b12-c04d55a1b7e2\""))
+    (def fixed
+      (let go ((l (self bytes 16)) (i 0) (acc ()))
+        (match
+          ((null? l) (%reverse acc))
+          (#t (go (rest l) (+ i 1)
+                  (pair (match
+                          ((= i 6) (| 64 (& (first l) 15)))
+                          ((= i 8) (| 128 (& (first l) 63)))
+                          (#t (first l)))
+                        acc))))))
+    (def h (Hex encode-bytes fixed))
+    ; (Str8 sub start LEN s) -- length, not end offset
+    (Str8 append (Str8 sub 0 8 h) "-" (Str8 sub 8 4 h) "-"
+                 (Str8 sub 12 4 h) "-" (Str8 sub 16 4 h) "-"
+                 (Str8 sub 20 12 h)))
+
+  (method sample (self k lst)
+    (doc "k distinct elements of lst, uniformly, in random order -- a shuffled prefix (#363). Raises kind-'value when k exceeds the population."
+      (param k INT "How many to draw")
+      (param lst LIST "The population")
+      (returns LIST "k distinct elements")
+      (sample "((Random sw 5) sample 2 (list 1 2 3 4))" "(1 3)"))
+    (when (> k (List length lst))
+      (Err raise 'value "Random sample: k exceeds the population" k))
+    (List take k (self shuffle lst)))
 
   (method shuffle (self lst)
     (doc "A new list holding the elements of lst in random order (Fisher-Yates)."

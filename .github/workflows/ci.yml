@@ -44,25 +44,24 @@ jobs:
           # Absolute path: the relocatable wrapper resolves its tree from $0.
           echo "$PWD/x-${X_LANG_VERSION}/bin" >> "$GITHUB_PATH"
 
-      # (Pin check) is blocked on x-lang#223: with the project root listed
-      # first (required so the repo's own modules aren't shadowed), the pin
-      # verbs treat "." as the overlay and flag project files as unlisted.
-      # Until that's fixed, verify the vendored tree directly.
+      # (Pin check) verifies the overlay against its lock AND audits for
+      # half-pins -- imports that fall through to the platform.  The
+      # project directory is passed explicitly: x-lang#223's fix covers
+      # only the explicit-dir path, and the bare verbs still misclassify
+      # the repo's own modules.  --no-pin keeps the scan outside the armed
+      # overlay -- the same fresh-session flow the pinning tutorial
+      # prescribes.
       - name: Overlay matches its lock
         run: |
-          # Bind the count before printing the marker: since v0.5.1,
-          # (Pin verify) prints its own matcher lines mid-evaluation, and
-          # a prefix displayed first ends up glued to those instead of to
-          # the count the grep below asserts on.
-          cat > run-verify.x <<'XEOF'
+          cat > run-check.x <<XEOF
           (import x/tool/pin)
-          (def n (Pin verify "deps"))
-          (display "verified-files: ") (display n)
+          (def r (Pin check "$PWD"))
+          (display "check-result: ") (write r)
           (newline)
           XEOF
-          x -f run-verify.x | tee verify-out.txt
-          rm -f run-verify.x
-          grep -qE "verified-files: [0-9]+" verify-out.txt || { echo "FAIL: overlay drifted from its lock"; exit 1; }
+          x --no-pin -f run-check.x | tee check-out.txt
+          rm -f run-check.x
+          grep -q "check-result: ()" check-out.txt || { echo "FAIL: overlay drifted from its lock, or an import falls through"; exit 1; }
 
       - name: Tests
         run: |
