@@ -1,5 +1,5 @@
 ;; Grid class from Mazes for Programmers
-;; Introducing Our Basic Grid, p.17 [listing address: confirm]
+;; Introducing Our Basic Grid, p.17
 (import-version-once maze/cell "1.2.*")
 
 (import x/num/random)
