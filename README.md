@@ -6,8 +6,7 @@ Programmers* (Jamis Buck) in [x-lang](https://github.com/jonruttan/x-lang).
 The code is built up **as the series is written** — one book-addressed commit at
 a time — so `git log` tracks the book. This repo starts as a scaffold and grows
 post by post. The series lives at
-[jonruttan.github.io](https://jonruttan.github.io/) (category
-`mazes-for-programmers`).
+[jonruttan.github.io/mazes-for-programmers](https://jonruttan.github.io/mazes-for-programmers/).
 
 ## Layout
 
@@ -19,9 +18,14 @@ post by post. The series lives at
 
 ## Requirements
 
-[x-lang](https://github.com/jonruttan/x-lang) — install the `x` command from the
-[release tarball](https://github.com/jonruttan/x-lang/releases) for the version
-in `deps.lock.xon` (no toolchain needed).
+[x-lang](https://github.com/jonruttan/x-lang) **v0.5.1** — install the `x`
+command from [that release's
+tarball](https://github.com/jonruttan/x-lang/releases/tag/v0.5.1) (no toolchain
+needed). `deps.lock.xon` is where the version is recorded.
+
+The code is written for that release. x-lang has moved since, and some
+spellings here differ from the current ones: string interpolation is `$"…"`
+here and `#"…"` now.
 
 The language itself is pinned: `pin.xon` boots a verified amalgam committed
 under `boot/`, and `deps.lock.xon` records the x-lang release it came from,
